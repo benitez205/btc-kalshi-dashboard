@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
-
+KALSHI_CLOCK_OFFSET_SECONDS = 20
 
 
 def get_btc_candles(limit=90):
@@ -154,8 +154,6 @@ try:
     settlement_time = datetime.fromisoformat(
         settlement_input.replace("Z", "+00:00")
     )
-
-    - KALSHI_CLOCK_OFFSET_SECONDS / 60
 
     minutes_left = max(
         (
