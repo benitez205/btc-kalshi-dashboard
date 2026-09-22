@@ -14,43 +14,41 @@ st.set_page_config(
 )
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+
 
 
 def get_btc_candles(limit=90):
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - pd.Timedelta(minutes=limit)
+
     response = requests.get(
-        BINANCE_KLINES,
+        "https://api.exchange.coinbase.com/products/BTC-USD/candles",
         params={
-            "symbol": "BTCUSDT",
-            "interval": "1m",
-            "limit": limit,
+            "granularity": 60,
+            "start": start_time.isoformat(),
+            "end": end_time.isoformat(),
         },
-        timeout=10,
+        headers={"User-Agent": "btc-kalshi-dashboard/1.0"},
+        timeout=15,
     )
     response.raise_for_status()
 
-    columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "taker_buy_base",
-        "taker_buy_quote",
-        "ignore",
-    ]
+    rows = response.json()
 
-    df = pd.DataFrame(response.json(), columns=columns)
+    if not rows:
+        raise ValueError("Coinbase returned no BTC candle data.")
+
+    df = pd.DataFrame(
+        rows,
+        columns=["open_time", "low", "high", "open", "close", "volume"],
+    )
 
     for column in ["open", "high", "low", "close", "volume"]:
         df[column] = pd.to_numeric(df[column])
 
-    df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    return df
+    df["time"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
+
+    return df.sort_values("time").reset_index(drop=True)
 
 
 def get_kalshi_market(ticker):
