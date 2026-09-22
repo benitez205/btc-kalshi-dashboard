@@ -155,10 +155,16 @@ try:
         settlement_input.replace("Z", "+00:00")
     )
 
-    minutes_left = max(
-        (settlement_time - datetime.now(timezone.utc)).total_seconds() / 60,
-        0,
-    )
+   KALSHI_CLOCK_OFFSET_SECONDS = 20
+
+minutes_left = max(
+    (
+        settlement_time
+        - datetime.now(timezone.utc)
+    ).total_seconds() / 60
+    - KALSHI_CLOCK_OFFSET_SECONDS / 60,
+    0,
+)
 
 except ValueError:
     st.error("Use this UTC time format: 2026-09-22T03:30:00Z")
