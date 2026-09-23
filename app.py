@@ -11,10 +11,44 @@ st.set_page_config(
     page_title="BTC Interval Monitor",
     page_icon="₿",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 KALSHI_CLOCK_OFFSET_SECONDS = 20
+
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 1200px;
+            padding-top: 1rem;
+            padding-bottom: 1rem;
+        }
+        [data-testid="stMetric"] {
+            background-color: rgba(128, 128, 128, 0.08);
+            border: 1px solid rgba(128, 128, 128, 0.18);
+            border-radius: 0.55rem;
+            padding: 0.45rem 0.65rem;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 0.78rem;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.15rem;
+        }
+        h1 {
+            font-size: 1.65rem;
+            margin-bottom: 0.1rem;
+        }
+        h2, h3 {
+            font-size: 1.05rem;
+            margin-top: 0.45rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def get_btc_candles(limit=90):
@@ -123,15 +157,11 @@ def calculate_model(df, strike, minutes_left):
 
 def calculate_setup_checker(df, strike, minutes_left, model):
     current_price = model["price"]
-
-    distance_pct = (
-        (current_price - strike) / strike
-    ) * 100
+    distance_pct = ((current_price - strike) / strike) * 100
 
     recent_prices = df["close"].tail(5)
     recent_high = float(recent_prices.max())
     recent_low = float(recent_prices.min())
-
     momentum_pct = model["momentum_5m"] * 100
 
     if current_price > strike:
@@ -142,7 +172,6 @@ def calculate_setup_checker(df, strike, minutes_left, model):
         direction = "NEUTRAL"
 
     far_enough_from_strike = abs(distance_pct) >= 0.10
-
     momentum_agrees = (
         (direction == "ABOVE" and momentum_pct > 0)
         or (direction == "BELOW" and momentum_pct < 0)
@@ -156,7 +185,6 @@ def calculate_setup_checker(df, strike, minutes_left, model):
         near_recent_barrier = True
 
     right_time_window = 4.5 <= minutes_left <= 8.5
-
     checks_passed = sum(
         [
             direction != "NEUTRAL",
@@ -175,29 +203,21 @@ def calculate_setup_checker(df, strike, minutes_left, model):
         and right_time_window
     ):
         label = f"CONSIDER {direction}"
-        explanation = (
-            "Price has at least a 0.10% cushion from the strike, "
-            "recent momentum agrees, price is not sitting at the "
-            "latest short-term high/low, and 5–8 minutes remain."
-        )
+        explanation = "All setup rules passed. This is a filter, not a prediction."
     else:
         label = "NO TRADE"
-
         reasons = []
 
         if not far_enough_from_strike:
-            reasons.append("BTC is too close to the strike")
-
+            reasons.append("too close to strike")
         if not momentum_agrees:
-            reasons.append("5-minute momentum disagrees")
-
+            reasons.append("momentum disagrees")
         if near_recent_barrier:
-            reasons.append("BTC is near a recent 5-minute high or low")
-
+            reasons.append("near recent high/low")
         if not right_time_window:
-            reasons.append("countdown is outside the 5–8 minute window")
+            reasons.append("outside 5–8 min window")
 
-        explanation = ". ".join(reasons) or "No clear setup."
+        explanation = " • ".join(reasons) or "No clear setup."
 
     return {
         "label": label,
@@ -215,17 +235,54 @@ def calculate_setup_checker(df, strike, minutes_left, model):
     }
 
 
-st.title("₿ BTC 15-Minute Interval Monitor")
-st.caption(
-    "Read-only research dashboard. It does not connect to your Kalshi "
-    "account and cannot place trades."
-)
+def calculate_risk_cap(setup, model, minutes_left, risk_bankroll):
+    if not 4.5 <= minutes_left <= 5.5:
+        return {
+            "amount": 0.0,
+            "percent": 0.0,
+            "reason": "Sizing appears only with about 5 minutes left.",
+        }
+
+    if setup["label"] == "NO TRADE":
+        return {
+            "amount": 0.0,
+            "percent": 0.0,
+            "reason": "No amount: the setup checker says NO TRADE.",
+        }
+
+    confidence = max(model["above"], model["below"]) * 100
+
+    if confidence < 60:
+        risk_percent = 0.0
+    elif confidence < 65:
+        risk_percent = 0.5
+    elif confidence < 70:
+        risk_percent = 1.0
+    elif confidence < 75:
+        risk_percent = 1.5
+    else:
+        risk_percent = 2.0
+
+    risk_amount = risk_bankroll * (risk_percent / 100)
+
+    return {
+        "amount": risk_amount,
+        "percent": risk_percent,
+        "reason": (
+            f"Conservative maximum based on {confidence:.1f}% model confidence. "
+            "It is not an instruction to trade."
+        ),
+    }
+
+
+st.title("₿ BTC 15-Minute Monitor")
+st.caption("Read-only research dashboard — no account connection and no order placement.")
 
 with st.sidebar:
-    st.header("Contract details")
+    st.subheader("Contract inputs")
 
     kalshi_ticker = st.text_input(
-        "Kalshi market ticker (optional)",
+        "Kalshi ticker (optional)",
         placeholder="KXBTC...",
     )
 
@@ -242,7 +299,15 @@ with st.sidebar:
         help="Example: 10:30 PM CDT = 03:30 UTC the following day.",
     )
 
-    st.button("Refresh data", type="primary")
+    risk_bankroll = st.number_input(
+        "Risk bankroll for sizing only ($)",
+        min_value=0.0,
+        value=25.0,
+        step=5.0,
+        help="Use only money you can afford to lose. This is a conservative cap, not a recommendation.",
+    )
+
+    st.button("Refresh data", type="primary", use_container_width=True)
 
 try:
     settlement_time = datetime.fromisoformat(
@@ -257,93 +322,52 @@ try:
         - KALSHI_CLOCK_OFFSET_SECONDS / 60,
         0,
     )
-
 except ValueError:
-    st.error("Use this UTC time format: 2026-09-22T03:30:00Z")
+    st.error("Use UTC format like: 2026-09-22T03:30:00Z")
     st.stop()
 
 try:
     candles = get_btc_candles()
-except requests.RequestException as error:
+except (requests.RequestException, ValueError) as error:
     st.error(f"Could not load BTC candle data: {error}")
     st.stop()
 
+if len(candles) < 31:
+    st.error("Not enough BTC candles returned. Refresh and try again.")
+    st.stop()
+
 model = calculate_model(candles, strike, minutes_left)
-
-setup = calculate_setup_checker(
-    candles,
-    strike,
-    minutes_left,
-    model,
-)
-
+setup = calculate_setup_checker(candles, strike, minutes_left, model)
+risk_cap = calculate_risk_cap(setup, model, minutes_left, risk_bankroll)
 market, orderbook, kalshi_error = get_kalshi_market(kalshi_ticker)
 
-col1, col2, col3, col4 = st.columns(4)
+spot_col, strike_col, distance_col, time_col = st.columns(4)
+spot_col.metric("BTC spot", f"${model['price']:,.2f}")
+strike_col.metric("Strike", f"${strike:,.2f}")
+distance_col.metric("Distance", f"${model['distance']:,.2f}")
+time_col.metric("Minutes left", f"{minutes_left:.1f}")
 
-col1.metric("BTC spot", f"${model['price']:,.2f}")
-col2.metric("Strike", f"${strike:,.2f}")
-col3.metric("Distance from strike", f"${model['distance']:,.2f}")
-col4.metric("Minutes remaining", f"{minutes_left:.1f}")
+setup_left, setup_right = st.columns([3, 2])
 
-st.divider()
-st.subheader("Setup checker")
+with setup_left:
+    st.subheader("Setup checker")
+    label_col, direction_col, checks_col = st.columns(3)
+    label_col.metric("Status", setup["label"])
+    direction_col.metric("Direction", setup["direction"])
+    checks_col.metric("Rules", f"{setup['checks_passed']} / 5")
+    st.caption(setup["explanation"])
 
-setup_col1, setup_col2, setup_col3, setup_col4 = st.columns(4)
-
-setup_col1.metric("Setup label", setup["label"])
-setup_col2.metric("Direction", setup["direction"])
-setup_col3.metric(
-    "Distance from strike",
-    f"{setup['distance_pct']:.3f}%",
-)
-setup_col4.metric(
-    "Rules passed",
-    f"{setup['checks_passed']} / 5",
-)
-
-st.caption(setup["explanation"])
-
-with st.expander("Show setup-check details"):
-    setup_details = pd.DataFrame(
-        [
-            {
-                "Rule": "BTC is at least 0.10% from strike",
-                "Pass": "Yes" if setup["far_enough"] else "No",
-            },
-            {
-                "Rule": "5-minute momentum matches direction",
-                "Pass": "Yes" if setup["momentum_agrees"] else "No",
-            },
-            {
-                "Rule": "Not at a recent 5-minute high/low",
-                "Pass": "Yes" if not setup["near_barrier"] else "No",
-            },
-            {
-                "Rule": "Between 5 and 8 minutes remaining",
-                "Pass": "Yes" if setup["right_time"] else "No",
-            },
-        ]
-    )
-
-    st.dataframe(
-        setup_details,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.write(
-        f"Recent 5-minute high: ${setup['recent_high']:,.2f}"
-    )
-    st.write(
-        f"Recent 5-minute low: ${setup['recent_low']:,.2f}"
-    )
+with setup_right:
+    st.subheader("5-minute risk cap")
+    amount_col, percent_col = st.columns(2)
+    amount_col.metric("Maximum risk", f"${risk_cap['amount']:,.2f}")
+    percent_col.metric("Bankroll cap", f"{risk_cap['percent']:.1f}%")
+    st.caption(risk_cap["reason"])
 
 left_column, right_column = st.columns([2, 1])
 
 with left_column:
     figure = go.Figure()
-
     figure.add_trace(
         go.Candlestick(
             x=candles["time"],
@@ -354,77 +378,78 @@ with left_column:
             name="BTC/USD",
         )
     )
-
     figure.add_hline(
         y=strike,
         line_dash="dash",
         line_color="#f5c542",
         annotation_text=f"Strike ${strike:,.2f}",
     )
-
     figure.update_layout(
-        title="Recent BTC 1-Minute Candles",
-        height=540,
+        title="BTC 1-Minute Candles",
+        height=410,
+        margin=dict(l=10, r=10, t=40, b=10),
         xaxis_rangeslider_visible=False,
         yaxis_title="BTC price",
+        showlegend=False,
     )
-
     st.plotly_chart(figure, use_container_width=True)
 
 with right_column:
-    st.subheader("Model estimate")
-
-    st.metric("Above probability", f"{model['above'] * 100:.1f}%")
-    st.metric("Below probability", f"{model['below'] * 100:.1f}%")
-    st.metric(
-        "5-minute momentum",
-        f"{model['momentum_5m'] * 100:.3f}%",
-    )
-    st.metric(
-        "1-minute volatility",
-        f"{model['volatility_1m'] * 100:.3f}%",
-    )
+    st.subheader("Model")
+    st.metric("Above", f"{model['above'] * 100:.1f}%")
+    st.metric("Below", f"{model['below'] * 100:.1f}%")
+    st.metric("5-min momentum", f"{model['momentum_5m'] * 100:.3f}%")
+    st.metric("1-min volatility", f"{model['volatility_1m'] * 100:.3f}%")
 
     if model["above"] > 0.60:
-        st.success("Model leans above. This is not a guarantee.")
+        st.success("Model leans above — not a guarantee.")
     elif model["above"] < 0.40:
-        st.warning("Model leans below. This is not a guarantee.")
+        st.warning("Model leans below — not a guarantee.")
     else:
-        st.info("Near coin-flip range. No strong model edge.")
+        st.info("Near coin-flip range.")
 
-st.divider()
-st.subheader("Kalshi public market data")
-
-if kalshi_ticker.strip() and kalshi_error:
-    st.error(f"Could not load Kalshi data: {kalshi_error}")
-
-elif market:
-    market_col1, market_col2, market_col3 = st.columns(3)
-
-    market_col1.metric(
-        "Market title",
-        market.get("title", "Not provided"),
+with st.expander("Setup details"):
+    setup_details = pd.DataFrame(
+        [
+            {
+                "Rule": "At least 0.10% from strike",
+                "Pass": "Yes" if setup["far_enough"] else "No",
+            },
+            {
+                "Rule": "5-minute momentum agrees",
+                "Pass": "Yes" if setup["momentum_agrees"] else "No",
+            },
+            {
+                "Rule": "Not near recent high/low",
+                "Pass": "Yes" if not setup["near_barrier"] else "No",
+            },
+            {
+                "Rule": "Between 5 and 8 minutes left",
+                "Pass": "Yes" if setup["right_time"] else "No",
+            },
+        ]
     )
-    market_col2.metric(
-        "YES bid",
-        f"{market.get('yes_bid', 'N/A')}¢",
-    )
-    market_col3.metric(
-        "YES ask",
-        f"{market.get('yes_ask', 'N/A')}¢",
-    )
-
-    with st.expander("Show public Kalshi order-book data"):
-        st.json(orderbook)
-
-else:
-    st.info(
-        "Enter a Kalshi ticker to load public market and order-book data."
+    st.dataframe(setup_details, use_container_width=True, hide_index=True)
+    st.caption(
+        f"Recent 5-minute high: ${setup['recent_high']:,.2f} | "
+        f"Recent 5-minute low: ${setup['recent_low']:,.2f}"
     )
 
-st.divider()
-st.warning(
-    "This is analysis only, not financial or betting advice. "
-    "The estimate can be wrong, especially near settlement. "
-    "Kalshi contract rules, settlement source, and timestamp decide the outcome."
+if kalshi_ticker.strip():
+    st.subheader("Kalshi public market data")
+
+    if kalshi_error:
+        st.error(f"Could not load Kalshi data: {kalshi_error}")
+    elif market:
+        market_col1, market_col2, market_col3 = st.columns(3)
+        market_col1.metric("Market", market.get("title", "Not provided"))
+        market_col2.metric("YES bid", f"{market.get('yes_bid', 'N/A')}¢")
+        market_col3.metric("YES ask", f"{market.get('yes_ask', 'N/A')}¢")
+
+        with st.expander("Order-book data"):
+            st.json(orderbook)
+
+st.caption(
+    "Analysis only, not financial or betting advice. The model can be wrong. "
+    "Contract rules, settlement source, and timestamp decide the outcome."
 )
