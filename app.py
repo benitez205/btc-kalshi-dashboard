@@ -184,7 +184,8 @@ def calculate_setup_checker(df, strike, minutes_left, model):
     else:
         near_recent_barrier = True
 
-    right_time_window = 4.5 <= minutes_left <= 8.5
+    right_time_window = 2.5 <= minutes_left <= 10.5
+
     checks_passed = sum(
         [
             direction != "NEUTRAL",
@@ -215,7 +216,7 @@ def calculate_setup_checker(df, strike, minutes_left, model):
         if near_recent_barrier:
             reasons.append("near recent high/low")
         if not right_time_window:
-            reasons.append("outside 5–8 min window")
+            reasons.append("outside 3–10 min window")
 
         explanation = " • ".join(reasons) or "No clear setup."
 
@@ -236,32 +237,33 @@ def calculate_setup_checker(df, strike, minutes_left, model):
 
 
 def calculate_risk_cap(setup, model, minutes_left, risk_bankroll):
-    if not 4.5 <= minutes_left <= 5.5:
+    if not 2.5 <= minutes_left <= 10.5:
         return {
             "amount": 0.0,
             "percent": 0.0,
-            "reason": "Sizing appears only with about 5 minutes left.",
-        }
-
-    if setup["label"] == "NO TRADE":
-        return {
-            "amount": 0.0,
-            "percent": 0.0,
-            "reason": "No amount: the setup checker says NO TRADE.",
+            "reason": "Sizing appears only between 3 and 10 minutes remaining.",
         }
 
     confidence = max(model["above"], model["below"]) * 100
 
-    if confidence < 60:
-        risk_percent = 0.0
+    if confidence < 55:
+        risk_percent = 0.25
+    elif confidence < 60:
+        risk_percent = 0.50
     elif confidence < 65:
-        risk_percent = 0.5
+        risk_percent = 0.75
     elif confidence < 70:
-        risk_percent = 1.0
+        risk_percent = 1.00
     elif confidence < 75:
-        risk_percent = 1.5
+        risk_percent = 1.50
     else:
-        risk_percent = 2.0
+        risk_percent = 2.00
+
+    if setup["label"] == "NO TRADE":
+        risk_percent = min(risk_percent, 0.25)
+        reason_prefix = "Weak or unclear setup: using the minimum cap. "
+    else:
+        reason_prefix = "Setup rules passed. "
 
     risk_amount = risk_bankroll * (risk_percent / 100)
 
@@ -269,14 +271,16 @@ def calculate_risk_cap(setup, model, minutes_left, risk_bankroll):
         "amount": risk_amount,
         "percent": risk_percent,
         "reason": (
-            f"Conservative maximum based on {confidence:.1f}% model confidence. "
-            "It is not an instruction to trade."
+            f"{reason_prefix}{confidence:.1f}% model confidence. "
+            "This is a maximum risk cap, not an instruction to trade."
         ),
     }
 
 
 st.title("₿ BTC 15-Minute Monitor")
-st.caption("Read-only research dashboard — no account connection and no order placement.")
+st.caption(
+    "Read-only research dashboard — no account connection and no order placement."
+)
 
 with st.sidebar:
     st.subheader("Contract inputs")
@@ -304,10 +308,17 @@ with st.sidebar:
         min_value=0.0,
         value=25.0,
         step=5.0,
-        help="Use only money you can afford to lose. This is a conservative cap, not a recommendation.",
+        help=(
+            "Use only money you can afford to lose. "
+            "This is a conservative cap, not a recommendation."
+        ),
     )
 
-    st.button("Refresh data", type="primary", use_container_width=True)
+    st.button(
+        "Refresh data",
+        type="primary",
+        use_container_width=True,
+    )
 
 try:
     settlement_time = datetime.fromisoformat(
@@ -339,6 +350,7 @@ if len(candles) < 31:
 model = calculate_model(candles, strike, minutes_left)
 setup = calculate_setup_checker(candles, strike, minutes_left, model)
 risk_cap = calculate_risk_cap(setup, model, minutes_left, risk_bankroll)
+
 market, orderbook, kalshi_error = get_kalshi_market(kalshi_ticker)
 
 spot_col, strike_col, distance_col, time_col = st.columns(4)
@@ -351,23 +363,28 @@ setup_left, setup_right = st.columns([3, 2])
 
 with setup_left:
     st.subheader("Setup checker")
+
     label_col, direction_col, checks_col = st.columns(3)
     label_col.metric("Status", setup["label"])
     direction_col.metric("Direction", setup["direction"])
     checks_col.metric("Rules", f"{setup['checks_passed']} / 5")
+
     st.caption(setup["explanation"])
 
 with setup_right:
-    st.subheader("5-minute risk cap")
+    st.subheader("3–10 minute risk cap")
+
     amount_col, percent_col = st.columns(2)
     amount_col.metric("Maximum risk", f"${risk_cap['amount']:,.2f}")
-    percent_col.metric("Bankroll cap", f"{risk_cap['percent']:.1f}%")
+    percent_col.metric("Bankroll cap", f"{risk_cap['percent']:.2f}%")
+
     st.caption(risk_cap["reason"])
 
 left_column, right_column = st.columns([2, 1])
 
 with left_column:
     figure = go.Figure()
+
     figure.add_trace(
         go.Candlestick(
             x=candles["time"],
@@ -378,12 +395,14 @@ with left_column:
             name="BTC/USD",
         )
     )
+
     figure.add_hline(
         y=strike,
         line_dash="dash",
         line_color="#f5c542",
         annotation_text=f"Strike ${strike:,.2f}",
     )
+
     figure.update_layout(
         title="BTC 1-Minute Candles",
         height=410,
@@ -392,14 +411,22 @@ with left_column:
         yaxis_title="BTC price",
         showlegend=False,
     )
+
     st.plotly_chart(figure, use_container_width=True)
 
 with right_column:
     st.subheader("Model")
+
     st.metric("Above", f"{model['above'] * 100:.1f}%")
     st.metric("Below", f"{model['below'] * 100:.1f}%")
-    st.metric("5-min momentum", f"{model['momentum_5m'] * 100:.3f}%")
-    st.metric("1-min volatility", f"{model['volatility_1m'] * 100:.3f}%")
+    st.metric(
+        "5-min momentum",
+        f"{model['momentum_5m'] * 100:.3f}%",
+    )
+    st.metric(
+        "1-min volatility",
+        f"{model['volatility_1m'] * 100:.3f}%",
+    )
 
     if model["above"] > 0.60:
         st.success("Model leans above — not a guarantee.")
@@ -424,12 +451,18 @@ with st.expander("Setup details"):
                 "Pass": "Yes" if not setup["near_barrier"] else "No",
             },
             {
-                "Rule": "Between 5 and 8 minutes left",
+                "Rule": "Between 3 and 10 minutes left",
                 "Pass": "Yes" if setup["right_time"] else "No",
             },
         ]
     )
-    st.dataframe(setup_details, use_container_width=True, hide_index=True)
+
+    st.dataframe(
+        setup_details,
+        use_container_width=True,
+        hide_index=True,
+    )
+
     st.caption(
         f"Recent 5-minute high: ${setup['recent_high']:,.2f} | "
         f"Recent 5-minute low: ${setup['recent_low']:,.2f}"
@@ -442,9 +475,19 @@ if kalshi_ticker.strip():
         st.error(f"Could not load Kalshi data: {kalshi_error}")
     elif market:
         market_col1, market_col2, market_col3 = st.columns(3)
-        market_col1.metric("Market", market.get("title", "Not provided"))
-        market_col2.metric("YES bid", f"{market.get('yes_bid', 'N/A')}¢")
-        market_col3.metric("YES ask", f"{market.get('yes_ask', 'N/A')}¢")
+
+        market_col1.metric(
+            "Market",
+            market.get("title", "Not provided"),
+        )
+        market_col2.metric(
+            "YES bid",
+            f"{market.get('yes_bid', 'N/A')}¢",
+        )
+        market_col3.metric(
+            "YES ask",
+            f"{market.get('yes_ask', 'N/A')}¢",
+        )
 
         with st.expander("Order-book data"):
             st.json(orderbook)
