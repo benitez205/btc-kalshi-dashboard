@@ -121,6 +121,100 @@ def calculate_model(df, strike, minutes_left):
     }
 
 
+def calculate_setup_checker(df, strike, minutes_left, model):
+    current_price = model["price"]
+
+    distance_pct = (
+        (current_price - strike) / strike
+    ) * 100
+
+    recent_prices = df["close"].tail(5)
+    recent_high = float(recent_prices.max())
+    recent_low = float(recent_prices.min())
+
+    momentum_pct = model["momentum_5m"] * 100
+
+    if current_price > strike:
+        direction = "ABOVE"
+    elif current_price < strike:
+        direction = "BELOW"
+    else:
+        direction = "NEUTRAL"
+
+    far_enough_from_strike = abs(distance_pct) >= 0.10
+
+    momentum_agrees = (
+        (direction == "ABOVE" and momentum_pct > 0)
+        or (direction == "BELOW" and momentum_pct < 0)
+    )
+
+    if direction == "ABOVE":
+        near_recent_barrier = current_price >= recent_high * 0.9995
+    elif direction == "BELOW":
+        near_recent_barrier = current_price <= recent_low * 1.0005
+    else:
+        near_recent_barrier = True
+
+    right_time_window = 4.5 <= minutes_left <= 8.5
+
+    checks_passed = sum(
+        [
+            direction != "NEUTRAL",
+            far_enough_from_strike,
+            momentum_agrees,
+            not near_recent_barrier,
+            right_time_window,
+        ]
+    )
+
+    if (
+        direction != "NEUTRAL"
+        and far_enough_from_strike
+        and momentum_agrees
+        and not near_recent_barrier
+        and right_time_window
+    ):
+        label = f"CONSIDER {direction}"
+        explanation = (
+            "Price has at least a 0.10% cushion from the strike, "
+            "recent momentum agrees, price is not sitting at the "
+            "latest short-term high/low, and 5–8 minutes remain."
+        )
+    else:
+        label = "NO TRADE"
+
+        reasons = []
+
+        if not far_enough_from_strike:
+            reasons.append("BTC is too close to the strike")
+
+        if not momentum_agrees:
+            reasons.append("5-minute momentum disagrees")
+
+        if near_recent_barrier:
+            reasons.append("BTC is near a recent 5-minute high or low")
+
+        if not right_time_window:
+            reasons.append("countdown is outside the 5–8 minute window")
+
+        explanation = ". ".join(reasons) or "No clear setup."
+
+    return {
+        "label": label,
+        "direction": direction,
+        "distance_pct": distance_pct,
+        "momentum_pct": momentum_pct,
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "far_enough": far_enough_from_strike,
+        "momentum_agrees": momentum_agrees,
+        "near_barrier": near_recent_barrier,
+        "right_time": right_time_window,
+        "checks_passed": checks_passed,
+        "explanation": explanation,
+    }
+
+
 st.title("₿ BTC 15-Minute Interval Monitor")
 st.caption(
     "Read-only research dashboard. It does not connect to your Kalshi "
@@ -175,6 +269,14 @@ except requests.RequestException as error:
     st.stop()
 
 model = calculate_model(candles, strike, minutes_left)
+
+setup = calculate_setup_checker(
+    candles,
+    strike,
+    minutes_left,
+    model,
+)
+
 market, orderbook, kalshi_error = get_kalshi_market(kalshi_ticker)
 
 col1, col2, col3, col4 = st.columns(4)
@@ -183,6 +285,59 @@ col1.metric("BTC spot", f"${model['price']:,.2f}")
 col2.metric("Strike", f"${strike:,.2f}")
 col3.metric("Distance from strike", f"${model['distance']:,.2f}")
 col4.metric("Minutes remaining", f"{minutes_left:.1f}")
+
+st.divider()
+st.subheader("Setup checker")
+
+setup_col1, setup_col2, setup_col3, setup_col4 = st.columns(4)
+
+setup_col1.metric("Setup label", setup["label"])
+setup_col2.metric("Direction", setup["direction"])
+setup_col3.metric(
+    "Distance from strike",
+    f"{setup['distance_pct']:.3f}%",
+)
+setup_col4.metric(
+    "Rules passed",
+    f"{setup['checks_passed']} / 5",
+)
+
+st.caption(setup["explanation"])
+
+with st.expander("Show setup-check details"):
+    setup_details = pd.DataFrame(
+        [
+            {
+                "Rule": "BTC is at least 0.10% from strike",
+                "Pass": "Yes" if setup["far_enough"] else "No",
+            },
+            {
+                "Rule": "5-minute momentum matches direction",
+                "Pass": "Yes" if setup["momentum_agrees"] else "No",
+            },
+            {
+                "Rule": "Not at a recent 5-minute high/low",
+                "Pass": "Yes" if not setup["near_barrier"] else "No",
+            },
+            {
+                "Rule": "Between 5 and 8 minutes remaining",
+                "Pass": "Yes" if setup["right_time"] else "No",
+            },
+        ]
+    )
+
+    st.dataframe(
+        setup_details,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write(
+        f"Recent 5-minute high: ${setup['recent_high']:,.2f}"
+    )
+    st.write(
+        f"Recent 5-minute low: ${setup['recent_low']:,.2f}"
+    )
 
 left_column, right_column = st.columns([2, 1])
 
@@ -196,7 +351,7 @@ with left_column:
             high=candles["high"],
             low=candles["low"],
             close=candles["close"],
-            name="BTC/USDT",
+            name="BTC/USD",
         )
     )
 
