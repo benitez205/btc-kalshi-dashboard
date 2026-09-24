@@ -1,3 +1,4 @@
+import io
 import math
 from datetime import datetime, timezone
 
@@ -17,6 +18,31 @@ st.set_page_config(
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 CHART_REFRESH_SECONDS = 30
+TRADE_LOG_COLUMNS = [
+    "logged_at_utc",
+    "settlement_time_utc",
+    "strike",
+    "snapshot_btc_price",
+    "snapshot_bot_label",
+    "snapshot_confidence",
+    "snapshot_bullish_signals",
+    "snapshot_bearish_signals",
+    "snapshot_atr_multiple",
+    "snapshot_ema_5",
+    "snapshot_ema_12",
+    "snapshot_rsi_14",
+    "side",
+    "contracts",
+    "entry_cents",
+    "exit_cents",
+    "fees",
+    "cost",
+    "proceeds",
+    "net_pnl",
+    "budget_cap",
+    "within_budget_cap",
+    "notes",
+]
 
 st.markdown(
     """
@@ -330,10 +356,6 @@ def calculate_budget_plan(
         warnings.append("Reserve cash is equal to or larger than the bankroll, so no order budget remains.")
     if risk_per_trade > available_for_orders:
         warnings.append("Risk cap exceeds cash available after your reserve.")
-    if buy_limit_cents <= 0 or buy_limit_cents >= 100:
-        warnings.append("Buy limit must be between 1¢ and 99¢.")
-    if sell_limit_cents <= 0 or sell_limit_cents >= 100:
-        warnings.append("Sell limit must be between 1¢ and 99¢.")
     if sell_limit_cents <= buy_limit_cents:
         warnings.append("Your sell limit is not above your buy limit, so it does not lock in a gross gain.")
     if contracts_allowed == 0 and buy_price > 0:
@@ -352,6 +374,59 @@ def calculate_budget_plan(
         "warnings": warnings,
     }
 
+
+def new_empty_trade_log():
+    return pd.DataFrame(columns=TRADE_LOG_COLUMNS)
+
+
+def create_trade_snapshot(settlement_time, strike, live_quote, chart_bot):
+    return {
+        "settlement_time_utc": settlement_time.isoformat(),
+        "strike": round(float(strike), 2),
+        "snapshot_btc_price": round(float(live_quote["price"]), 2),
+        "snapshot_bot_label": chart_bot["label"],
+        "snapshot_confidence": chart_bot["confidence"],
+        "snapshot_bullish_signals": chart_bot["bullish_signals"],
+        "snapshot_bearish_signals": chart_bot["bearish_signals"],
+        "snapshot_atr_multiple": round(float(chart_bot["atr_multiple"]), 3),
+        "snapshot_ema_5": round(float(chart_bot["ema_5"]), 2),
+        "snapshot_ema_12": round(float(chart_bot["ema_12"]), 2),
+        "snapshot_rsi_14": round(float(chart_bot["rsi_14"]), 2),
+    }
+
+
+def add_trade_to_log(snapshot, side, contracts, entry_cents, exit_cents, fees, notes, budget_cap):
+    cost = contracts * (entry_cents / 100)
+    proceeds = contracts * (exit_cents / 100)
+    net_pnl = proceeds - cost - fees
+
+    row = {
+        "logged_at_utc": datetime.now(timezone.utc).isoformat(),
+        **snapshot,
+        "side": side,
+        "contracts": contracts,
+        "entry_cents": entry_cents,
+        "exit_cents": exit_cents,
+        "fees": round(fees, 2),
+        "cost": round(cost, 2),
+        "proceeds": round(proceeds, 2),
+        "net_pnl": round(net_pnl, 2),
+        "budget_cap": round(budget_cap, 2),
+        "within_budget_cap": cost <= budget_cap,
+        "notes": notes,
+    }
+    st.session_state.trade_log = pd.concat(
+        [st.session_state.trade_log, pd.DataFrame([row])],
+        ignore_index=True,
+    )
+
+
+if "trade_log" not in st.session_state:
+    st.session_state.trade_log = new_empty_trade_log()
+if "latest_snapshot" not in st.session_state:
+    st.session_state.latest_snapshot = None
+if "auto_snapshot_key" not in st.session_state:
+    st.session_state.auto_snapshot_key = None
 
 st.title("₿ BTC Live 15-Minute Monitor")
 st.caption(
@@ -386,46 +461,22 @@ with st.sidebar:
     st.divider()
     st.header("Budget & limit planner")
     bankroll = st.number_input(
-        "Current bankroll ($)",
-        min_value=0.0,
-        value=69.00,
-        step=1.00,
-        key="bankroll",
+        "Current bankroll ($)", min_value=0.0, value=69.00, step=1.00
     )
     reserve_cash = st.number_input(
-        "Cash reserve ($)",
-        min_value=0.0,
-        value=24.00,
-        step=1.00,
-        key="reserve_cash",
+        "Cash reserve ($)", min_value=0.0, value=24.00, step=1.00
     )
     risk_per_trade = st.number_input(
-        "Maximum risk per trade ($)",
-        min_value=0.0,
-        value=2.00,
-        step=0.50,
-        key="risk_per_trade",
+        "Maximum risk per trade ($)", min_value=0.0, value=2.00, step=0.50
     )
     contract_side = st.selectbox(
-        "Contract side you are evaluating",
-        options=["YES", "NO"],
-        help="This planner calculates cash limits only. It does not choose a side for you.",
+        "Contract side you are evaluating", options=["YES", "NO"]
     )
     buy_limit_cents = st.number_input(
-        "Your maximum buy limit (¢)",
-        min_value=1,
-        max_value=99,
-        value=40,
-        step=1,
-        key="buy_limit_cents",
+        "Your maximum buy limit (¢)", min_value=1, max_value=99, value=40, step=1
     )
     sell_limit_cents = st.number_input(
-        "Your planned take-profit limit (¢)",
-        min_value=1,
-        max_value=99,
-        value=55,
-        step=1,
-        key="sell_limit_cents",
+        "Your planned take-profit limit (¢)", min_value=1, max_value=99, value=55, step=1
     )
 
 try:
@@ -437,11 +488,7 @@ except ValueError:
     st.stop()
 
 budget_plan = calculate_budget_plan(
-    bankroll,
-    reserve_cash,
-    risk_per_trade,
-    buy_limit_cents,
-    sell_limit_cents,
+    bankroll, reserve_cash, risk_per_trade, buy_limit_cents, sell_limit_cents
 )
 
 
@@ -459,8 +506,18 @@ def live_dashboard():
         return
 
     now_utc = datetime.now(timezone.utc)
-    minutes_left = max((settlement_time - now_utc).total_seconds() / 60, 0)
+    seconds_left = max((settlement_time - now_utc).total_seconds(), 0)
+    minutes_left = seconds_left / 60
     chart_bot = calculate_chart_bot(candles, strike, live_quote["price"])
+    current_snapshot = create_trade_snapshot(
+        settlement_time, strike, live_quote, chart_bot
+    )
+    st.session_state.latest_snapshot = current_snapshot
+
+    snapshot_key = f"{settlement_time.isoformat()}|{strike:.2f}"
+    if seconds_left <= 0 and st.session_state.auto_snapshot_key != snapshot_key:
+        st.session_state.auto_snapshot_key = snapshot_key
+        st.session_state.latest_snapshot = current_snapshot
 
     spot_col, strike_col, distance_col, time_col, quote_col = st.columns(5)
     spot_col.metric("Live BTC spot", f"${live_quote['price']:,.2f}")
@@ -473,6 +530,12 @@ def live_dashboard():
         f"Live panel updates every {refresh_seconds} second(s). "
         f"Candles, EMA, RSI, and ATR refresh at most every {CHART_REFRESH_SECONDS} seconds."
     )
+
+    if seconds_left <= 0:
+        st.info(
+            "Clock has reached zero. The most recent dashboard data is saved as the trade-log snapshot. "
+            "Confirm settlement using the market's official rules and source."
+        )
 
     st.divider()
     st.subheader("Chart research bot")
@@ -500,8 +563,7 @@ def live_dashboard():
 
     with st.expander("Show chart-bot signals"):
         signal_df = pd.DataFrame(
-            chart_bot["signals"],
-            columns=["Indicator", "Signal", "Explanation"],
+            chart_bot["signals"], columns=["Indicator", "Signal", "Explanation"]
         )
         st.dataframe(signal_df, use_container_width=True, hide_index=True)
 
@@ -513,61 +575,43 @@ def live_dashboard():
         st.caption(
             f"Distance from strike: ${chart_bot['distance_dollars']:,.2f} | "
             f"ATR multiple: {chart_bot['atr_multiple']:.2f}× | "
-            f"15-minute range: ${chart_bot['range_low']:,.2f} to "
-            f"${chart_bot['range_high']:,.2f}"
+            f"15-minute range: ${chart_bot['range_low']:,.2f} to ${chart_bot['range_high']:,.2f}"
         )
 
     left_column, right_column = st.columns([2, 1])
-
     with left_column:
         chart_df = chart_bot["df"]
         figure = go.Figure()
         figure.add_trace(
             go.Candlestick(
-                x=chart_df["time"],
-                open=chart_df["open"],
-                high=chart_df["high"],
-                low=chart_df["low"],
-                close=chart_df["close"],
-                name="BTC/USD",
+                x=chart_df["time"], open=chart_df["open"], high=chart_df["high"],
+                low=chart_df["low"], close=chart_df["close"], name="BTC/USD"
             )
         )
         figure.add_trace(
             go.Scatter(
-                x=chart_df["time"],
-                y=chart_df["ema_5"],
-                mode="lines",
-                name="EMA 5",
-                line=dict(color="#00cc96", width=1.5),
+                x=chart_df["time"], y=chart_df["ema_5"], mode="lines", name="EMA 5",
+                line=dict(color="#00cc96", width=1.5)
             )
         )
         figure.add_trace(
             go.Scatter(
-                x=chart_df["time"],
-                y=chart_df["ema_12"],
-                mode="lines",
-                name="EMA 12",
-                line=dict(color="#636efa", width=1.5),
+                x=chart_df["time"], y=chart_df["ema_12"], mode="lines", name="EMA 12",
+                line=dict(color="#636efa", width=1.5)
             )
         )
         figure.add_hline(
-            y=strike,
-            line_dash="dash",
-            line_color="#f5c542",
-            annotation_text=f"Strike ${strike:,.2f}",
+            y=strike, line_dash="dash", line_color="#f5c542",
+            annotation_text=f"Strike ${strike:,.2f}"
         )
         figure.add_hline(
-            y=live_quote["price"],
-            line_dash="dot",
-            line_color="#00cc96",
-            annotation_text=f"Live ${live_quote['price']:,.2f}",
+            y=live_quote["price"], line_dash="dot", line_color="#00cc96",
+            annotation_text=f"Live ${live_quote['price']:,.2f}"
         )
         figure.update_layout(
             title="BTC 1-Minute Candles with Live Price and EMA Lines",
-            height=480,
-            margin=dict(l=10, r=10, t=40, b=10),
-            xaxis_rangeslider_visible=False,
-            yaxis_title="BTC price",
+            height=480, margin=dict(l=10, r=10, t=40, b=10),
+            xaxis_rangeslider_visible=False, yaxis_title="BTC price"
         )
         st.plotly_chart(figure, use_container_width=True)
 
@@ -601,11 +645,6 @@ plan_col6.metric("Take-profit limit", f"{sell_limit_cents}¢")
 plan_col7.metric("Proceeds at target", f"${budget_plan['potential_sale_proceeds']:,.2f}")
 plan_col8.metric("Gross target profit", f"${budget_plan['potential_profit']:,.2f}")
 
-st.caption(
-    f"If {budget_plan['contracts_allowed']} contract(s) settle in your favor instead of being sold early, "
-    f"the maximum gross settlement profit would be ${budget_plan['maximum_settlement_profit']:,.2f} before fees."
-)
-
 if budget_plan["warnings"]:
     for warning in budget_plan["warnings"]:
         st.warning(warning)
@@ -614,15 +653,79 @@ else:
         "Planner check passed: proposed order stays within your stated trade-risk cap and protects the stated cash reserve."
     )
 
-with st.expander("How this planner calculates size"):
-    st.code(
-        "maximum contracts = floor(min(risk per trade, bankroll − reserve) ÷ buy limit price)",
-        language="text",
+st.divider()
+st.subheader("Trade log")
+st.caption(
+    "When the clock reaches zero, the dashboard keeps the latest market snapshot. Enter the actual fills manually, then download the CSV after your session."
+)
+
+if st.session_state.latest_snapshot:
+    snapshot = st.session_state.latest_snapshot
+    snapshot_col1, snapshot_col2, snapshot_col3, snapshot_col4 = st.columns(4)
+    snapshot_col1.metric("Snapshot BTC", f"${snapshot['snapshot_btc_price']:,.2f}")
+    snapshot_col2.metric("Snapshot label", snapshot["snapshot_bot_label"])
+    snapshot_col3.metric("Snapshot RSI", f"{snapshot['snapshot_rsi_14']:.1f}")
+    snapshot_col4.metric("Snapshot ATR multiple", f"{snapshot['snapshot_atr_multiple']:.2f}×")
+else:
+    st.info("Waiting for the live dashboard to collect the first trade-log snapshot.")
+
+with st.form("trade_log_form", clear_on_submit=True):
+    st.write("Add a completed trade")
+    form_col1, form_col2, form_col3, form_col4 = st.columns(4)
+    logged_side = form_col1.selectbox("Side traded", options=["YES", "NO"])
+    logged_contracts = form_col2.number_input(
+        "Contracts", min_value=1, value=1, step=1
     )
-    st.write(
-        "It assumes a binary contract bought at your entered limit. It shows gross figures only; "
-        "fees, partial fills, and unfilled limit orders can change real results."
+    logged_entry = form_col3.number_input(
+        "Actual entry (¢)", min_value=1, max_value=99, value=40, step=1
     )
+    logged_exit = form_col4.number_input(
+        "Actual exit / settlement (¢)", min_value=0, max_value=100, value=55, step=1
+    )
+    logged_fees = st.number_input(
+        "Total fees ($)", min_value=0.0, value=0.00, step=0.01
+    )
+    logged_notes = st.text_area(
+        "Notes (optional)",
+        placeholder="Example: Followed plan; sell limit filled before settlement.",
+    )
+    save_trade = st.form_submit_button("Save completed trade")
+
+if save_trade:
+    if st.session_state.latest_snapshot is None:
+        st.error("No market snapshot is available yet. Wait for the live panel to load.")
+    else:
+        add_trade_to_log(
+            st.session_state.latest_snapshot,
+            logged_side,
+            int(logged_contracts),
+            int(logged_entry),
+            int(logged_exit),
+            float(logged_fees),
+            logged_notes,
+            risk_per_trade,
+        )
+        st.success("Trade saved to this browser session's log.")
+
+trade_log = st.session_state.trade_log.copy()
+if not trade_log.empty:
+    trade_log["net_pnl"] = pd.to_numeric(trade_log["net_pnl"])
+    log_col1, log_col2, log_col3, log_col4 = st.columns(4)
+    log_col1.metric("Completed trades", str(len(trade_log)))
+    log_col2.metric("Net P&L", f"${trade_log['net_pnl'].sum():,.2f}")
+    log_col3.metric("Average net P&L", f"${trade_log['net_pnl'].mean():,.2f}")
+    log_col4.metric("Win rate", f"{(trade_log['net_pnl'] > 0).mean() * 100:.1f}%")
+
+    st.dataframe(trade_log, use_container_width=True, hide_index=True)
+    csv_data = trade_log.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download trade log CSV",
+        data=csv_data,
+        file_name="btc_trade_log.csv",
+        mime="text/csv",
+    )
+else:
+    st.info("No completed trades logged yet.")
 
 if kalshi_ticker.strip():
     st.divider()
@@ -636,14 +739,11 @@ if kalshi_ticker.strip():
         market_col1.metric("Market", market.get("title", "Not provided"))
         market_col2.metric("YES bid", f"{market.get('yes_bid', 'N/A')}¢")
         market_col3.metric("YES ask", f"{market.get('yes_ask', 'N/A')}¢")
-
         with st.expander("Show public Kalshi order-book data"):
             st.json(orderbook)
 
 st.caption(
-    "Research only, not financial or betting advice. A Coinbase quote can differ "
-    "from the source and timestamp used for Kalshi settlement. Limit orders may not fill "
-    "or may fill only partially."
+    "Research only, not financial or betting advice. The trade log is stored only in the current browser session. "
+    "Download the CSV regularly; a page reload, browser close, or Streamlit redeploy can clear it."
 )
-
 
