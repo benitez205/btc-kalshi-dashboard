@@ -8,13 +8,62 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="BTC Interval Monitor",
+    page_title="BTC Live Interval Monitor",
     page_icon="₿",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
-KALSHI_CLOCK_OFFSET_SECONDS = 20
+COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 1200px;
+            padding-top: 0.9rem;
+            padding-bottom: 0.9rem;
+        }
+        [data-testid="stMetric"] {
+            background-color: rgba(128, 128, 128, 0.08);
+            border: 1px solid rgba(128, 128, 128, 0.18);
+            border-radius: 0.55rem;
+            padding: 0.45rem 0.65rem;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 0.78rem;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.12rem;
+        }
+        h1 {
+            font-size: 1.6rem;
+            margin-bottom: 0.1rem;
+        }
+        h2, h3 {
+            font-size: 1.05rem;
+            margin-top: 0.45rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def get_live_btc_price():
+    response = requests.get(
+        COINBASE_TICKER_URL,
+        headers={"User-Agent": "btc-kalshi-dashboard/1.0"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    return {
+        "price": float(data["price"]),
+        "time": pd.to_datetime(data["time"], utc=True),
+    }
 
 
 def get_btc_candles(limit=90):
@@ -32,7 +81,6 @@ def get_btc_candles(limit=90):
         timeout=15,
     )
     response.raise_for_status()
-
     rows = response.json()
 
     if not rows:
@@ -47,7 +95,6 @@ def get_btc_candles(limit=90):
         df[column] = pd.to_numeric(df[column])
 
     df["time"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
-
     return df.sort_values("time").reset_index(drop=True)
 
 
@@ -61,64 +108,18 @@ def get_kalshi_market(ticker):
             timeout=10,
         )
         market_response.raise_for_status()
-
-        market = market_response.json().get(
-            "market",
-            market_response.json(),
-        )
+        market = market_response.json().get("market", market_response.json())
 
         book_response = requests.get(
             f"{KALSHI_BASE}/markets/{ticker.strip()}/orderbook",
             timeout=10,
         )
         book_response.raise_for_status()
-
-        orderbook = book_response.json().get(
-            "orderbook",
-            book_response.json(),
-        )
-
+        orderbook = book_response.json().get("orderbook", book_response.json())
         return market, orderbook, None
 
     except requests.RequestException as error:
         return None, None, str(error)
-
-
-def normal_cdf(value):
-    return 0.5 * math.erfc(-value / math.sqrt(2))
-
-
-def calculate_model(df, strike, minutes_left):
-    closes = df["close"].to_numpy()
-    current_price = closes[-1]
-
-    recent_returns = np.diff(np.log(closes[-31:]))
-    sigma_1m = float(np.std(recent_returns, ddof=1))
-
-    horizon_volatility = max(
-        sigma_1m * math.sqrt(max(minutes_left, 1)),
-        0.00015,
-    )
-
-    momentum_5m = current_price / closes[-6] - 1
-    momentum_drift = 0.20 * momentum_5m * min(minutes_left, 10)
-
-    z_score = (
-        math.log(strike) - (math.log(current_price) + momentum_drift)
-    ) / horizon_volatility
-
-    probability_above = float(
-        np.clip(1 - normal_cdf(z_score), 0.02, 0.98)
-    )
-
-    return {
-        "price": current_price,
-        "distance": current_price - strike,
-        "momentum_5m": momentum_5m,
-        "volatility_1m": sigma_1m,
-        "above": probability_above,
-        "below": 1 - probability_above,
-    }
 
 
 def calculate_rsi(closes, period=14):
@@ -139,7 +140,6 @@ def calculate_rsi(closes, period=14):
 
     relative_strength = average_gain / average_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + relative_strength))
-
     return rsi.fillna(50.0)
 
 
@@ -153,18 +153,17 @@ def calculate_atr(df, period=5):
         ],
         axis=1,
     ).max(axis=1)
-
     return true_range.rolling(period, min_periods=period).mean()
 
 
-def calculate_chart_bot(df, strike, minutes_left):
+def calculate_chart_bot(df, strike, live_price):
     bot_df = df.copy()
     bot_df["ema_5"] = bot_df["close"].ewm(span=5, adjust=False).mean()
     bot_df["ema_12"] = bot_df["close"].ewm(span=12, adjust=False).mean()
     bot_df["rsi_14"] = calculate_rsi(bot_df["close"], period=14)
     bot_df["atr_5"] = calculate_atr(bot_df, period=5)
 
-    current_price = float(bot_df["close"].iloc[-1])
+    current_price = live_price
     ema_5 = float(bot_df["ema_5"].iloc[-1])
     ema_12 = float(bot_df["ema_12"].iloc[-1])
     rsi_14 = float(bot_df["rsi_14"].iloc[-1])
@@ -183,54 +182,54 @@ def calculate_chart_bot(df, strike, minutes_left):
     distance_pct = ((current_price - strike) / strike) * 100
     atr_multiple = distance_dollars / atr_5 if atr_5 > 0 else 0.0
 
-    above_points = 0
-    below_points = 0
+    price_above_strike = current_price > strike
+    price_below_strike = current_price < strike
+    bullish_signals = 0
+    bearish_signals = 0
     signal_rows = []
 
-    if current_price > strike:
-        above_points += 1
-        signal_rows.append(("Price vs strike", "ABOVE", "Price is above strike"))
-    elif current_price < strike:
-        below_points += 1
-        signal_rows.append(("Price vs strike", "BELOW", "Price is below strike"))
+    if price_above_strike:
+        signal_rows.append(("Price vs strike", "ABOVE", "Live price is above strike"))
+    elif price_below_strike:
+        signal_rows.append(("Price vs strike", "BELOW", "Live price is below strike"))
     else:
-        signal_rows.append(("Price vs strike", "NEUTRAL", "Price equals strike"))
+        signal_rows.append(("Price vs strike", "NEUTRAL", "Live price equals strike"))
 
     if ema_5 > ema_12:
-        above_points += 1
-        signal_rows.append(("EMA trend", "ABOVE", "5 EMA is above 12 EMA"))
+        bullish_signals += 1
+        signal_rows.append(("EMA trend", "BULLISH", "5 EMA is above 12 EMA"))
     elif ema_5 < ema_12:
-        below_points += 1
-        signal_rows.append(("EMA trend", "BELOW", "5 EMA is below 12 EMA"))
+        bearish_signals += 1
+        signal_rows.append(("EMA trend", "BEARISH", "5 EMA is below 12 EMA"))
     else:
         signal_rows.append(("EMA trend", "NEUTRAL", "EMAs are equal"))
 
     if rsi_14 >= 55:
-        above_points += 1
-        signal_rows.append(("RSI 14", "ABOVE", f"RSI is {rsi_14:.1f}"))
+        bullish_signals += 1
+        signal_rows.append(("RSI 14", "BULLISH", f"RSI is {rsi_14:.1f}"))
     elif rsi_14 <= 45:
-        below_points += 1
-        signal_rows.append(("RSI 14", "BELOW", f"RSI is {rsi_14:.1f}"))
+        bearish_signals += 1
+        signal_rows.append(("RSI 14", "BEARISH", f"RSI is {rsi_14:.1f}"))
     else:
         signal_rows.append(("RSI 14", "NEUTRAL", f"RSI is {rsi_14:.1f}"))
 
     if green_candles >= 2:
-        above_points += 1
-        signal_rows.append(("Last 3 candles", "ABOVE", f"{green_candles} green candles"))
+        bullish_signals += 1
+        signal_rows.append(("Last 3 candles", "BULLISH", f"{green_candles} green candles"))
     elif red_candles >= 2:
-        below_points += 1
-        signal_rows.append(("Last 3 candles", "BELOW", f"{red_candles} red candles"))
+        bearish_signals += 1
+        signal_rows.append(("Last 3 candles", "BEARISH", f"{red_candles} red candles"))
     else:
         signal_rows.append(("Last 3 candles", "NEUTRAL", "Mixed candles"))
 
     if current_price > range_midpoint:
-        above_points += 1
-        signal_rows.append(("15-minute range", "ABOVE", "Price is above range midpoint"))
+        bullish_signals += 1
+        signal_rows.append(("15-minute range", "BULLISH", "Live price is above range midpoint"))
     elif current_price < range_midpoint:
-        below_points += 1
-        signal_rows.append(("15-minute range", "BELOW", "Price is below range midpoint"))
+        bearish_signals += 1
+        signal_rows.append(("15-minute range", "BEARISH", "Live price is below range midpoint"))
     else:
-        signal_rows.append(("15-minute range", "NEUTRAL", "Price is at range midpoint"))
+        signal_rows.append(("15-minute range", "NEUTRAL", "Live price is at range midpoint"))
 
     if atr_multiple >= 2:
         cushion_label = "STRONG"
@@ -244,42 +243,57 @@ def calculate_chart_bot(df, strike, minutes_left):
 
     signal_rows.append(("ATR cushion", cushion_label, cushion_text))
 
-    time_ok = 3 <= minutes_left <= 10
-    close_to_strike = abs(distance_pct) < 0.05
-    atr_filter_passes = atr_multiple >= 1
+    bullish_pressure = bullish_signals >= 3
+    bearish_pressure = bearish_signals >= 3
+    reversal_watch = False
+    reversal_reason = "No strong conflict between price location and momentum."
 
-    if close_to_strike:
-        label = "NO CLEAR EDGE"
+    if price_above_strike and bearish_pressure:
+        reversal_watch = True
+        reversal_reason = (
+            "Price is above strike, but at least three short-term signals are bearish."
+        )
+    elif price_below_strike and bullish_pressure:
+        reversal_watch = True
+        reversal_reason = (
+            "Price is below strike, but at least three short-term signals are bullish."
+        )
+
+    if atr_multiple < 1:
+        label = "TOO CLOSE / NO CLEAR EDGE"
         confidence = "Low"
-        summary = "BTC is too close to the strike price."
-    elif not time_ok:
-        label = "NO CLEAR EDGE"
+        summary = (
+            "Price is within one recent ATR of the strike. Ordinary BTC volatility "
+            "could change the above/below result."
+        )
+    elif reversal_watch and price_above_strike:
+        label = "ABOVE — WEAKENING / REVERSAL WATCH"
         confidence = "Low"
-        summary = "Bot only scores the 3–10 minute window."
-    elif not atr_filter_passes:
-        label = "NO CLEAR EDGE"
+        summary = reversal_reason
+    elif reversal_watch and price_below_strike:
+        label = "BELOW — WEAKENING / REVERSAL WATCH"
         confidence = "Low"
-        summary = "BTC is too close to strike compared with recent volatility."
-    elif above_points >= 4 and above_points > below_points:
-        label = "LEAN ABOVE"
+        summary = reversal_reason
+    elif price_above_strike and bullish_pressure:
+        label = "ABOVE — TREND CONFIRMED"
         confidence = "Medium"
-        summary = f"{above_points}/5 chart signals lean above with an ATR cushion."
-    elif below_points >= 4 and below_points > above_points:
-        label = "LEAN BELOW"
+        summary = "Price is above strike and at least three short-term signals are bullish."
+    elif price_below_strike and bearish_pressure:
+        label = "BELOW — TREND CONFIRMED"
         confidence = "Medium"
-        summary = f"{below_points}/5 chart signals lean below with an ATR cushion."
+        summary = "Price is below strike and at least three short-term signals are bearish."
     else:
-        label = "NO CLEAR EDGE"
+        label = "TOO CLOSE / NO CLEAR EDGE"
         confidence = "Low"
-        summary = "Chart signals are mixed."
+        summary = "Price location and short-term momentum do not agree strongly enough."
 
     return {
         "df": bot_df,
         "label": label,
         "confidence": confidence,
         "summary": summary,
-        "above_points": above_points,
-        "below_points": below_points,
+        "bullish_signals": bullish_signals,
+        "bearish_signals": bearish_signals,
         "current_price": current_price,
         "distance_dollars": distance_dollars,
         "distance_pct": distance_pct,
@@ -289,82 +303,101 @@ def calculate_chart_bot(df, strike, minutes_left):
         "atr_5": atr_5,
         "atr_multiple": atr_multiple,
         "cushion_label": cushion_label,
-        "green_candles": green_candles,
-        "red_candles": red_candles,
         "range_high": range_high,
         "range_low": range_low,
         "range_midpoint": range_midpoint,
+        "reversal_watch": reversal_watch,
+        "reversal_reason": reversal_reason,
         "signals": signal_rows,
     }
 
 
-st.title("₿ BTC 15-Minute Interval Monitor")
+st.title("₿ BTC Live 15-Minute Monitor")
 st.caption(
-    "Read-only research dashboard. It does not connect to your Kalshi "
-    "account and cannot place trades."
+    "Live Coinbase quote + 1-minute chart research. Read-only; it cannot place, close, or modify Kalshi orders."
 )
 
 with st.sidebar:
-    st.header("Contract details")
+    st.header("Contract inputs")
 
     kalshi_ticker = st.text_input(
         "Kalshi market ticker (optional)",
         placeholder="KXBTC...",
     )
-
     strike = st.number_input(
         "BTC threshold / strike",
         min_value=1.0,
         value=85513.00,
         step=0.01,
     )
-
     settlement_input = st.text_input(
         "Settlement time (UTC)",
         value="2026-09-22T03:30:00Z",
         help="Example: 10:30 PM CDT = 03:30 UTC the following day.",
     )
-
-    st.button("Refresh data", type="primary")
+    refresh_seconds = st.selectbox(
+        "Live refresh interval",
+        options=[1, 2, 5, 10, 15, 30],
+        index=2,
+        help="1-second refreshes may be unreliable on Streamlit Cloud and can hit API limits.",
+    )
+    st.button("Refresh now", type="primary")
 
 try:
     settlement_time = datetime.fromisoformat(
         settlement_input.replace("Z", "+00:00")
     )
-
-    minutes_left = max(
-        (
-            settlement_time
-            - datetime.now(timezone.utc)
-        ).total_seconds() / 60
-        - KALSHI_CLOCK_OFFSET_SECONDS / 60,
-        0,
-    )
-
 except ValueError:
-    st.error("Use this UTC time format: 2026-09-22T03:30:00Z")
+    st.error("Use UTC format like: 2026-09-22T03:30:00Z")
     st.stop()
+
+if "last_chart_refresh" not in st.session_state:
+    st.session_state.last_chart_refresh = None
+if "cached_candles" not in st.session_state:
+    st.session_state.cached_candles = None
 
 try:
-    candles = get_btc_candles()
-except (requests.RequestException, ValueError) as error:
-    st.error(f"Could not load BTC candle data: {error}")
+    live_quote = get_live_btc_price()
+except requests.RequestException as error:
+    st.error(f"Could not load live BTC price: {error}")
     st.stop()
 
+now_utc = datetime.now(timezone.utc)
+minutes_left = max((settlement_time - now_utc).total_seconds() / 60, 0)
+
+chart_needs_refresh = (
+    st.session_state.cached_candles is None
+    or st.session_state.last_chart_refresh is None
+    or (now_utc - st.session_state.last_chart_refresh).total_seconds() >= 30
+)
+
+if chart_needs_refresh:
+    try:
+        st.session_state.cached_candles = get_btc_candles()
+        st.session_state.last_chart_refresh = now_utc
+    except (requests.RequestException, ValueError) as error:
+        st.error(f"Could not load BTC candle data: {error}")
+        st.stop()
+
+candles = st.session_state.cached_candles
 if len(candles) < 31:
     st.error("Not enough BTC candles returned. Refresh and try again.")
     st.stop()
 
-model = calculate_model(candles, strike, minutes_left)
-chart_bot = calculate_chart_bot(candles, strike, minutes_left)
+chart_bot = calculate_chart_bot(candles, strike, live_quote["price"])
 market, orderbook, kalshi_error = get_kalshi_market(kalshi_ticker)
 
-col1, col2, col3, col4 = st.columns(4)
+spot_col, strike_col, distance_col, time_col, quote_col = st.columns(5)
+spot_col.metric("Live BTC spot", f"${live_quote['price']:,.2f}")
+strike_col.metric("Strike", f"${strike:,.2f}")
+distance_col.metric("Distance", f"${live_quote['price'] - strike:,.2f}")
+time_col.metric("Minutes left", f"{minutes_left:.2f}")
+quote_col.metric("Quote time", live_quote["time"].strftime("%H:%M:%S UTC"))
 
-col1.metric("BTC spot", f"${model['price']:,.2f}")
-col2.metric("Strike", f"${strike:,.2f}")
-col3.metric("Distance from strike", f"${model['distance']:,.2f}")
-col4.metric("Minutes remaining", f"{minutes_left:.1f}")
+st.caption(
+    f"Live ticker refreshes every {refresh_seconds} second(s). "
+    "Candles and chart indicators refresh every 30 seconds."
+)
 
 st.divider()
 st.subheader("Chart research bot")
@@ -372,10 +405,23 @@ st.subheader("Chart research bot")
 bot_col1, bot_col2, bot_col3, bot_col4, bot_col5 = st.columns(5)
 bot_col1.metric("Bot result", chart_bot["label"])
 bot_col2.metric("Confidence", chart_bot["confidence"])
-bot_col3.metric("Above signals", f"{chart_bot['above_points']} / 5")
-bot_col4.metric("Below signals", f"{chart_bot['below_points']} / 5")
+bot_col3.metric("Bullish signals", f"{chart_bot['bullish_signals']} / 4")
+bot_col4.metric("Bearish signals", f"{chart_bot['bearish_signals']} / 4")
 bot_col5.metric("ATR cushion", chart_bot["cushion_label"])
 st.caption(chart_bot["summary"])
+
+if chart_bot["reversal_watch"]:
+    st.warning(
+        f"REVERSAL WATCH: {chart_bot['reversal_reason']} "
+        "This is a research warning, not a recommendation to increase position size."
+    )
+elif chart_bot["atr_multiple"] < 1:
+    st.info(
+        "STRIKE RISK: Price is close to the strike relative to recent volatility. "
+        "A normal move could change the above/below result."
+    )
+else:
+    st.success("No strong conflict between current price location and short-term momentum.")
 
 with st.expander("Show chart-bot signals"):
     signal_df = pd.DataFrame(
@@ -402,7 +448,6 @@ left_column, right_column = st.columns([2, 1])
 with left_column:
     chart_df = chart_bot["df"]
     figure = go.Figure()
-
     figure.add_trace(
         go.Candlestick(
             x=chart_df["time"],
@@ -413,7 +458,6 @@ with left_column:
             name="BTC/USD",
         )
     )
-
     figure.add_trace(
         go.Scatter(
             x=chart_df["time"],
@@ -423,7 +467,6 @@ with left_column:
             line=dict(color="#00cc96", width=1.5),
         )
     )
-
     figure.add_trace(
         go.Scatter(
             x=chart_df["time"],
@@ -433,77 +476,64 @@ with left_column:
             line=dict(color="#636efa", width=1.5),
         )
     )
-
     figure.add_hline(
         y=strike,
         line_dash="dash",
         line_color="#f5c542",
         annotation_text=f"Strike ${strike:,.2f}",
     )
-
+    figure.add_hline(
+        y=live_quote["price"],
+        line_dash="dot",
+        line_color="#00cc96",
+        annotation_text=f"Live ${live_quote['price']:,.2f}",
+    )
     figure.update_layout(
-        title="Recent BTC 1-Minute Candles with EMA Lines",
-        height=540,
+        title="BTC 1-Minute Candles with Live Price and EMA Lines",
+        height=480,
+        margin=dict(l=10, r=10, t=40, b=10),
         xaxis_rangeslider_visible=False,
         yaxis_title="BTC price",
     )
-
     st.plotly_chart(figure, use_container_width=True)
 
 with right_column:
-    st.subheader("Model estimate")
-
-    st.metric("Above probability", f"{model['above'] * 100:.1f}%")
-    st.metric("Below probability", f"{model['below'] * 100:.1f}%")
-    st.metric(
-        "5-minute momentum",
-        f"{model['momentum_5m'] * 100:.3f}%",
-    )
-    st.metric(
-        "1-minute volatility",
-        f"{model['volatility_1m'] * 100:.3f}%",
+    st.subheader("Signal interpretation")
+    st.metric("Signal label", chart_bot["label"])
+    st.metric("Distance vs ATR", f"{chart_bot['atr_multiple']:.2f}×")
+    st.write(
+        "The dashboard is informational only. It does not recommend adding money, "
+        "opening a trade, closing a trade, or setting an auto-sell price."
     )
 
-    if model["above"] > 0.60:
-        st.success("Model leans above. This is not a guarantee.")
-    elif model["above"] < 0.40:
-        st.warning("Model leans below. This is not a guarantee.")
-    else:
-        st.info("Near coin-flip range. No strong model edge.")
+if kalshi_ticker.strip():
+    st.divider()
+    st.subheader("Kalshi public market data")
 
-st.divider()
-st.subheader("Kalshi public market data")
+    if kalshi_error:
+        st.error(f"Could not load Kalshi data: {kalshi_error}")
+    elif market:
+        market_col1, market_col2, market_col3 = st.columns(3)
+        market_col1.metric("Market", market.get("title", "Not provided"))
+        market_col2.metric("YES bid", f"{market.get('yes_bid', 'N/A')}¢")
+        market_col3.metric("YES ask", f"{market.get('yes_ask', 'N/A')}¢")
 
-if kalshi_ticker.strip() and kalshi_error:
-    st.error(f"Could not load Kalshi data: {kalshi_error}")
+        with st.expander("Show public Kalshi order-book data"):
+            st.json(orderbook)
 
-elif market:
-    market_col1, market_col2, market_col3 = st.columns(3)
-
-    market_col1.metric(
-        "Market title",
-        market.get("title", "Not provided"),
-    )
-    market_col2.metric(
-        "YES bid",
-        f"{market.get('yes_bid', 'N/A')}¢",
-    )
-    market_col3.metric(
-        "YES ask",
-        f"{market.get('yes_ask', 'N/A')}¢",
-    )
-
-    with st.expander("Show public Kalshi order-book data"):
-        st.json(orderbook)
-
-else:
-    st.info(
-        "Enter a Kalshi ticker to load public market and order-book data."
-    )
-
-st.divider()
-st.warning(
-    "Chart research only, not financial or betting advice. This bot uses "
-    "historical Coinbase candles and can be wrong. Kalshi contract rules, "
-    "settlement source, and timestamp decide the outcome."
+st.caption(
+    "Research only, not financial or betting advice. A Coinbase quote can differ "
+    "from the source and timestamp used for Kalshi settlement."
 )
+
+st.markdown(
+    f"""
+    <script>
+        setTimeout(function() {{
+            window.parent.location.reload();
+        }}, {refresh_seconds * 1000});
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
+
