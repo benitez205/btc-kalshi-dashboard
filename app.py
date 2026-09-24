@@ -16,6 +16,7 @@ st.set_page_config(
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+CHART_REFRESH_SECONDS = 30
 
 st.markdown(
     """
@@ -59,13 +60,13 @@ def get_live_btc_price():
     )
     response.raise_for_status()
     data = response.json()
-
     return {
         "price": float(data["price"]),
         "time": pd.to_datetime(data["time"], utc=True),
     }
 
 
+@st.cache_data(ttl=25, show_spinner=False)
 def get_btc_candles(limit=90):
     end_time = datetime.now(timezone.utc)
     start_time = end_time - pd.Timedelta(minutes=limit)
@@ -90,7 +91,6 @@ def get_btc_candles(limit=90):
         rows,
         columns=["open_time", "low", "high", "open", "close", "volume"],
     )
-
     for column in ["open", "high", "low", "close", "volume"]:
         df[column] = pd.to_numeric(df[column])
 
@@ -98,6 +98,7 @@ def get_btc_candles(limit=90):
     return df.sort_values("time").reset_index(drop=True)
 
 
+@st.cache_data(ttl=10, show_spinner=False)
 def get_kalshi_market(ticker):
     if not ticker.strip():
         return None, None, None
@@ -117,7 +118,6 @@ def get_kalshi_market(ticker):
         book_response.raise_for_status()
         orderbook = book_response.json().get("orderbook", book_response.json())
         return market, orderbook, None
-
     except requests.RequestException as error:
         return None, None, str(error)
 
@@ -126,7 +126,6 @@ def calculate_rsi(closes, period=14):
     deltas = closes.diff()
     gains = deltas.clip(lower=0)
     losses = -deltas.clip(upper=0)
-
     average_gain = gains.ewm(
         alpha=1 / period,
         adjust=False,
@@ -137,10 +136,8 @@ def calculate_rsi(closes, period=14):
         adjust=False,
         min_periods=period,
     ).mean()
-
     relative_strength = average_gain / average_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + relative_strength))
-    return rsi.fillna(50.0)
+    return (100 - (100 / (1 + relative_strength))).fillna(50.0)
 
 
 def calculate_atr(df, period=5):
@@ -240,7 +237,6 @@ def calculate_chart_bot(df, strike, live_price):
     else:
         cushion_label = "TOO CLOSE"
         cushion_text = "Distance is less than recent 5-minute ATR"
-
     signal_rows.append(("ATR cushion", cushion_label, cushion_text))
 
     bullish_pressure = bullish_signals >= 3
@@ -294,9 +290,7 @@ def calculate_chart_bot(df, strike, live_price):
         "summary": summary,
         "bullish_signals": bullish_signals,
         "bearish_signals": bearish_signals,
-        "current_price": current_price,
         "distance_dollars": distance_dollars,
-        "distance_pct": distance_pct,
         "ema_5": ema_5,
         "ema_12": ema_12,
         "rsi_14": rsi_14,
@@ -305,7 +299,6 @@ def calculate_chart_bot(df, strike, live_price):
         "cushion_label": cushion_label,
         "range_high": range_high,
         "range_low": range_low,
-        "range_midpoint": range_midpoint,
         "reversal_watch": reversal_watch,
         "reversal_reason": reversal_reason,
         "signals": signal_rows,
@@ -319,7 +312,6 @@ st.caption(
 
 with st.sidebar:
     st.header("Contract inputs")
-
     kalshi_ticker = st.text_input(
         "Kalshi market ticker (optional)",
         placeholder="KXBTC...",
@@ -336,12 +328,12 @@ with st.sidebar:
         help="Example: 10:30 PM CDT = 03:30 UTC the following day.",
     )
     refresh_seconds = st.selectbox(
-        "Live refresh interval",
-        options=[1, 2, 5, 10, 15, 30],
-        index=2,
-        help="1-second refreshes may be unreliable on Streamlit Cloud and can hit API limits.",
+        "Live panel interval",
+        options=[1, 2, 5, 10],
+        index=1,
+        help="The live dashboard panel refreshes automatically at this interval.",
     )
-    st.button("Refresh now", type="primary")
+    st.caption(f"Candles and indicators are cached for {CHART_REFRESH_SECONDS} seconds.")
 
 try:
     settlement_time = datetime.fromisoformat(
@@ -351,164 +343,149 @@ except ValueError:
     st.error("Use UTC format like: 2026-09-22T03:30:00Z")
     st.stop()
 
-if "last_chart_refresh" not in st.session_state:
-    st.session_state.last_chart_refresh = None
-if "cached_candles" not in st.session_state:
-    st.session_state.cached_candles = None
 
-try:
-    live_quote = get_live_btc_price()
-except requests.RequestException as error:
-    st.error(f"Could not load live BTC price: {error}")
-    st.stop()
-
-now_utc = datetime.now(timezone.utc)
-minutes_left = max((settlement_time - now_utc).total_seconds() / 60, 0)
-
-chart_needs_refresh = (
-    st.session_state.cached_candles is None
-    or st.session_state.last_chart_refresh is None
-    or (now_utc - st.session_state.last_chart_refresh).total_seconds() >= 30
-)
-
-if chart_needs_refresh:
+@st.fragment(run_every=f"{refresh_seconds}s")
+def live_dashboard():
     try:
-        st.session_state.cached_candles = get_btc_candles()
-        st.session_state.last_chart_refresh = now_utc
+        live_quote = get_live_btc_price()
+        candles = get_btc_candles()
     except (requests.RequestException, ValueError) as error:
-        st.error(f"Could not load BTC candle data: {error}")
-        st.stop()
+        st.error(f"Could not load live market data: {error}")
+        return
 
-candles = st.session_state.cached_candles
-if len(candles) < 31:
-    st.error("Not enough BTC candles returned. Refresh and try again.")
-    st.stop()
+    if len(candles) < 31:
+        st.error("Not enough BTC candles returned. Please wait for the next refresh.")
+        return
 
-chart_bot = calculate_chart_bot(candles, strike, live_quote["price"])
-market, orderbook, kalshi_error = get_kalshi_market(kalshi_ticker)
+    now_utc = datetime.now(timezone.utc)
+    minutes_left = max((settlement_time - now_utc).total_seconds() / 60, 0)
+    chart_bot = calculate_chart_bot(candles, strike, live_quote["price"])
 
-spot_col, strike_col, distance_col, time_col, quote_col = st.columns(5)
-spot_col.metric("Live BTC spot", f"${live_quote['price']:,.2f}")
-strike_col.metric("Strike", f"${strike:,.2f}")
-distance_col.metric("Distance", f"${live_quote['price'] - strike:,.2f}")
-time_col.metric("Minutes left", f"{minutes_left:.2f}")
-quote_col.metric("Quote time", live_quote["time"].strftime("%H:%M:%S UTC"))
-
-st.caption(
-    f"Live ticker refreshes every {refresh_seconds} second(s). "
-    "Candles and chart indicators refresh every 30 seconds."
-)
-
-st.divider()
-st.subheader("Chart research bot")
-
-bot_col1, bot_col2, bot_col3, bot_col4, bot_col5 = st.columns(5)
-bot_col1.metric("Bot result", chart_bot["label"])
-bot_col2.metric("Confidence", chart_bot["confidence"])
-bot_col3.metric("Bullish signals", f"{chart_bot['bullish_signals']} / 4")
-bot_col4.metric("Bearish signals", f"{chart_bot['bearish_signals']} / 4")
-bot_col5.metric("ATR cushion", chart_bot["cushion_label"])
-st.caption(chart_bot["summary"])
-
-if chart_bot["reversal_watch"]:
-    st.warning(
-        f"REVERSAL WATCH: {chart_bot['reversal_reason']} "
-        "This is a research warning, not a recommendation to increase position size."
-    )
-elif chart_bot["atr_multiple"] < 1:
-    st.info(
-        "STRIKE RISK: Price is close to the strike relative to recent volatility. "
-        "A normal move could change the above/below result."
-    )
-else:
-    st.success("No strong conflict between current price location and short-term momentum.")
-
-with st.expander("Show chart-bot signals"):
-    signal_df = pd.DataFrame(
-        chart_bot["signals"],
-        columns=["Indicator", "Signal", "Explanation"],
-    )
-    st.dataframe(signal_df, use_container_width=True, hide_index=True)
-
-    detail_col1, detail_col2, detail_col3, detail_col4 = st.columns(4)
-    detail_col1.metric("EMA 5", f"${chart_bot['ema_5']:,.2f}")
-    detail_col2.metric("EMA 12", f"${chart_bot['ema_12']:,.2f}")
-    detail_col3.metric("RSI 14", f"{chart_bot['rsi_14']:.1f}")
-    detail_col4.metric("5-min ATR", f"${chart_bot['atr_5']:,.2f}")
+    spot_col, strike_col, distance_col, time_col, quote_col = st.columns(5)
+    spot_col.metric("Live BTC spot", f"${live_quote['price']:,.2f}")
+    strike_col.metric("Strike", f"${strike:,.2f}")
+    distance_col.metric("Distance", f"${live_quote['price'] - strike:,.2f}")
+    time_col.metric("Minutes left", f"{minutes_left:.2f}")
+    quote_col.metric("Quote time", live_quote["time"].strftime("%H:%M:%S UTC"))
 
     st.caption(
-        f"Distance from strike: ${chart_bot['distance_dollars']:,.2f} | "
-        f"ATR multiple: {chart_bot['atr_multiple']:.2f}× | "
-        f"15-minute range: ${chart_bot['range_low']:,.2f} to "
-        f"${chart_bot['range_high']:,.2f}"
+        f"Live panel updates every {refresh_seconds} second(s). "
+        f"Candles, EMA, RSI, and ATR refresh at most every {CHART_REFRESH_SECONDS} seconds."
     )
 
-left_column, right_column = st.columns([2, 1])
+    st.divider()
+    st.subheader("Chart research bot")
 
-with left_column:
-    chart_df = chart_bot["df"]
-    figure = go.Figure()
-    figure.add_trace(
-        go.Candlestick(
-            x=chart_df["time"],
-            open=chart_df["open"],
-            high=chart_df["high"],
-            low=chart_df["low"],
-            close=chart_df["close"],
-            name="BTC/USD",
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=chart_df["time"],
-            y=chart_df["ema_5"],
-            mode="lines",
-            name="EMA 5",
-            line=dict(color="#00cc96", width=1.5),
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=chart_df["time"],
-            y=chart_df["ema_12"],
-            mode="lines",
-            name="EMA 12",
-            line=dict(color="#636efa", width=1.5),
-        )
-    )
-    figure.add_hline(
-        y=strike,
-        line_dash="dash",
-        line_color="#f5c542",
-        annotation_text=f"Strike ${strike:,.2f}",
-    )
-    figure.add_hline(
-        y=live_quote["price"],
-        line_dash="dot",
-        line_color="#00cc96",
-        annotation_text=f"Live ${live_quote['price']:,.2f}",
-    )
-    figure.update_layout(
-        title="BTC 1-Minute Candles with Live Price and EMA Lines",
-        height=480,
-        margin=dict(l=10, r=10, t=40, b=10),
-        xaxis_rangeslider_visible=False,
-        yaxis_title="BTC price",
-    )
-    st.plotly_chart(figure, use_container_width=True)
+    bot_col1, bot_col2, bot_col3, bot_col4, bot_col5 = st.columns(5)
+    bot_col1.metric("Bot result", chart_bot["label"])
+    bot_col2.metric("Confidence", chart_bot["confidence"])
+    bot_col3.metric("Bullish signals", f"{chart_bot['bullish_signals']} / 4")
+    bot_col4.metric("Bearish signals", f"{chart_bot['bearish_signals']} / 4")
+    bot_col5.metric("ATR cushion", chart_bot["cushion_label"])
+    st.caption(chart_bot["summary"])
 
-with right_column:
-    st.subheader("Signal interpretation")
-    st.metric("Signal label", chart_bot["label"])
-    st.metric("Distance vs ATR", f"{chart_bot['atr_multiple']:.2f}×")
-    st.write(
-        "The dashboard is informational only. It does not recommend adding money, "
-        "opening a trade, closing a trade, or setting an auto-sell price."
-    )
+    if chart_bot["reversal_watch"]:
+        st.warning(
+            f"REVERSAL WATCH: {chart_bot['reversal_reason']} "
+            "This is a research warning, not a recommendation to increase position size."
+        )
+    elif chart_bot["atr_multiple"] < 1:
+        st.info(
+            "STRIKE RISK: Price is close to the strike relative to recent volatility. "
+            "A normal move could change the above/below result."
+        )
+    else:
+        st.success("No strong conflict between current price location and short-term momentum.")
+
+    with st.expander("Show chart-bot signals"):
+        signal_df = pd.DataFrame(
+            chart_bot["signals"],
+            columns=["Indicator", "Signal", "Explanation"],
+        )
+        st.dataframe(signal_df, use_container_width=True, hide_index=True)
+
+        detail_col1, detail_col2, detail_col3, detail_col4 = st.columns(4)
+        detail_col1.metric("EMA 5", f"${chart_bot['ema_5']:,.2f}")
+        detail_col2.metric("EMA 12", f"${chart_bot['ema_12']:,.2f}")
+        detail_col3.metric("RSI 14", f"{chart_bot['rsi_14']:.1f}")
+        detail_col4.metric("5-min ATR", f"${chart_bot['atr_5']:,.2f}")
+        st.caption(
+            f"Distance from strike: ${chart_bot['distance_dollars']:,.2f} | "
+            f"ATR multiple: {chart_bot['atr_multiple']:.2f}× | "
+            f"15-minute range: ${chart_bot['range_low']:,.2f} to "
+            f"${chart_bot['range_high']:,.2f}"
+        )
+
+    left_column, right_column = st.columns([2, 1])
+
+    with left_column:
+        chart_df = chart_bot["df"]
+        figure = go.Figure()
+        figure.add_trace(
+            go.Candlestick(
+                x=chart_df["time"],
+                open=chart_df["open"],
+                high=chart_df["high"],
+                low=chart_df["low"],
+                close=chart_df["close"],
+                name="BTC/USD",
+            )
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=chart_df["time"],
+                y=chart_df["ema_5"],
+                mode="lines",
+                name="EMA 5",
+                line=dict(color="#00cc96", width=1.5),
+            )
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=chart_df["time"],
+                y=chart_df["ema_12"],
+                mode="lines",
+                name="EMA 12",
+                line=dict(color="#636efa", width=1.5),
+            )
+        )
+        figure.add_hline(
+            y=strike,
+            line_dash="dash",
+            line_color="#f5c542",
+            annotation_text=f"Strike ${strike:,.2f}",
+        )
+        figure.add_hline(
+            y=live_quote["price"],
+            line_dash="dot",
+            line_color="#00cc96",
+            annotation_text=f"Live ${live_quote['price']:,.2f}",
+        )
+        figure.update_layout(
+            title="BTC 1-Minute Candles with Live Price and EMA Lines",
+            height=480,
+            margin=dict(l=10, r=10, t=40, b=10),
+            xaxis_rangeslider_visible=False,
+            yaxis_title="BTC price",
+        )
+        st.plotly_chart(figure, use_container_width=True)
+
+    with right_column:
+        st.subheader("Signal interpretation")
+        st.metric("Signal label", chart_bot["label"])
+        st.metric("Distance vs ATR", f"{chart_bot['atr_multiple']:.2f}×")
+        st.write(
+            "The dashboard is informational only. It does not recommend adding money, "
+            "opening a trade, closing a trade, or setting an auto-sell price."
+        )
+
+
+live_dashboard()
 
 if kalshi_ticker.strip():
     st.divider()
     st.subheader("Kalshi public market data")
+    market, orderbook, kalshi_error = get_kalshi_market(kalshi_ticker)
 
     if kalshi_error:
         st.error(f"Could not load Kalshi data: {kalshi_error}")
@@ -526,14 +503,4 @@ st.caption(
     "from the source and timestamp used for Kalshi settlement."
 )
 
-st.markdown(
-    f"""
-    <script>
-        setTimeout(function() {{
-            window.parent.location.reload();
-        }}, {refresh_seconds * 1000});
-    </script>
-    """,
-    unsafe_allow_html=True,
-)
 
