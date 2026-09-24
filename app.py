@@ -176,7 +176,6 @@ def calculate_chart_bot(df, strike, live_price):
     red_candles = int((last_three["close"] < last_three["open"]).sum())
 
     distance_dollars = abs(current_price - strike)
-    distance_pct = ((current_price - strike) / strike) * 100
     atr_multiple = distance_dollars / atr_5 if atr_5 > 0 else 0.0
 
     price_above_strike = current_price > strike
@@ -305,6 +304,55 @@ def calculate_chart_bot(df, strike, live_price):
     }
 
 
+def calculate_budget_plan(
+    bankroll,
+    reserve_cash,
+    risk_per_trade,
+    buy_limit_cents,
+    sell_limit_cents,
+):
+    available_for_orders = max(bankroll - reserve_cash, 0)
+    buy_price = buy_limit_cents / 100
+    sell_price = sell_limit_cents / 100
+
+    contracts_by_risk = math.floor(risk_per_trade / buy_price) if buy_price > 0 else 0
+    contracts_by_cash = math.floor(available_for_orders / buy_price) if buy_price > 0 else 0
+    contracts_allowed = max(min(contracts_by_risk, contracts_by_cash), 0)
+
+    maximum_cost = contracts_allowed * buy_price
+    potential_sale_proceeds = contracts_allowed * sell_price
+    potential_profit = potential_sale_proceeds - maximum_cost
+    maximum_settlement_value = float(contracts_allowed)
+    maximum_settlement_profit = maximum_settlement_value - maximum_cost
+
+    warnings = []
+    if reserve_cash >= bankroll:
+        warnings.append("Reserve cash is equal to or larger than the bankroll, so no order budget remains.")
+    if risk_per_trade > available_for_orders:
+        warnings.append("Risk cap exceeds cash available after your reserve.")
+    if buy_limit_cents <= 0 or buy_limit_cents >= 100:
+        warnings.append("Buy limit must be between 1¢ and 99¢.")
+    if sell_limit_cents <= 0 or sell_limit_cents >= 100:
+        warnings.append("Sell limit must be between 1¢ and 99¢.")
+    if sell_limit_cents <= buy_limit_cents:
+        warnings.append("Your sell limit is not above your buy limit, so it does not lock in a gross gain.")
+    if contracts_allowed == 0 and buy_price > 0:
+        warnings.append("Risk cap or available cash is too low to purchase one contract at this limit.")
+    if risk_per_trade > bankroll * 0.05:
+        warnings.append("Risk per trade exceeds 5% of the bankroll. Consider a smaller fixed cap.")
+
+    return {
+        "available_for_orders": available_for_orders,
+        "contracts_allowed": contracts_allowed,
+        "maximum_cost": maximum_cost,
+        "potential_sale_proceeds": potential_sale_proceeds,
+        "potential_profit": potential_profit,
+        "maximum_settlement_value": maximum_settlement_value,
+        "maximum_settlement_profit": maximum_settlement_profit,
+        "warnings": warnings,
+    }
+
+
 st.title("₿ BTC Live 15-Minute Monitor")
 st.caption(
     "Live Coinbase quote + 1-minute chart research. Read-only; it cannot place, close, or modify Kalshi orders."
@@ -335,6 +383,51 @@ with st.sidebar:
     )
     st.caption(f"Candles and indicators are cached for {CHART_REFRESH_SECONDS} seconds.")
 
+    st.divider()
+    st.header("Budget & limit planner")
+    bankroll = st.number_input(
+        "Current bankroll ($)",
+        min_value=0.0,
+        value=69.00,
+        step=1.00,
+        key="bankroll",
+    )
+    reserve_cash = st.number_input(
+        "Cash reserve ($)",
+        min_value=0.0,
+        value=24.00,
+        step=1.00,
+        key="reserve_cash",
+    )
+    risk_per_trade = st.number_input(
+        "Maximum risk per trade ($)",
+        min_value=0.0,
+        value=2.00,
+        step=0.50,
+        key="risk_per_trade",
+    )
+    contract_side = st.selectbox(
+        "Contract side you are evaluating",
+        options=["YES", "NO"],
+        help="This planner calculates cash limits only. It does not choose a side for you.",
+    )
+    buy_limit_cents = st.number_input(
+        "Your maximum buy limit (¢)",
+        min_value=1,
+        max_value=99,
+        value=40,
+        step=1,
+        key="buy_limit_cents",
+    )
+    sell_limit_cents = st.number_input(
+        "Your planned take-profit limit (¢)",
+        min_value=1,
+        max_value=99,
+        value=55,
+        step=1,
+        key="sell_limit_cents",
+    )
+
 try:
     settlement_time = datetime.fromisoformat(
         settlement_input.replace("Z", "+00:00")
@@ -342,6 +435,14 @@ try:
 except ValueError:
     st.error("Use UTC format like: 2026-09-22T03:30:00Z")
     st.stop()
+
+budget_plan = calculate_budget_plan(
+    bankroll,
+    reserve_cash,
+    risk_per_trade,
+    buy_limit_cents,
+    sell_limit_cents,
+)
 
 
 @st.fragment(run_every=f"{refresh_seconds}s")
@@ -482,6 +583,47 @@ def live_dashboard():
 
 live_dashboard()
 
+st.divider()
+st.subheader("Budget & limit planner")
+st.caption(
+    "Enter your own limits first. This calculator checks size and cash exposure; it does not generate a trade, buy price, or sell price."
+)
+
+plan_col1, plan_col2, plan_col3, plan_col4 = st.columns(4)
+plan_col1.metric("Side evaluated", contract_side)
+plan_col2.metric("Available after reserve", f"${budget_plan['available_for_orders']:,.2f}")
+plan_col3.metric("Maximum contracts", str(budget_plan["contracts_allowed"]))
+plan_col4.metric("Maximum order cost", f"${budget_plan['maximum_cost']:,.2f}")
+
+plan_col5, plan_col6, plan_col7, plan_col8 = st.columns(4)
+plan_col5.metric("Buy limit", f"{buy_limit_cents}¢")
+plan_col6.metric("Take-profit limit", f"{sell_limit_cents}¢")
+plan_col7.metric("Proceeds at target", f"${budget_plan['potential_sale_proceeds']:,.2f}")
+plan_col8.metric("Gross target profit", f"${budget_plan['potential_profit']:,.2f}")
+
+st.caption(
+    f"If {budget_plan['contracts_allowed']} contract(s) settle in your favor instead of being sold early, "
+    f"the maximum gross settlement profit would be ${budget_plan['maximum_settlement_profit']:,.2f} before fees."
+)
+
+if budget_plan["warnings"]:
+    for warning in budget_plan["warnings"]:
+        st.warning(warning)
+else:
+    st.success(
+        "Planner check passed: proposed order stays within your stated trade-risk cap and protects the stated cash reserve."
+    )
+
+with st.expander("How this planner calculates size"):
+    st.code(
+        "maximum contracts = floor(min(risk per trade, bankroll − reserve) ÷ buy limit price)",
+        language="text",
+    )
+    st.write(
+        "It assumes a binary contract bought at your entered limit. It shows gross figures only; "
+        "fees, partial fills, and unfilled limit orders can change real results."
+    )
+
 if kalshi_ticker.strip():
     st.divider()
     st.subheader("Kalshi public market data")
@@ -500,7 +642,8 @@ if kalshi_ticker.strip():
 
 st.caption(
     "Research only, not financial or betting advice. A Coinbase quote can differ "
-    "from the source and timestamp used for Kalshi settlement."
+    "from the source and timestamp used for Kalshi settlement. Limit orders may not fill "
+    "or may fill only partially."
 )
 
 
