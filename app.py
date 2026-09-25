@@ -1,4 +1,3 @@
-import io
 import math
 from datetime import datetime, timezone
 
@@ -19,59 +18,23 @@ KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 CHART_REFRESH_SECONDS = 30
 TRADE_LOG_COLUMNS = [
-    "logged_at_utc",
-    "settlement_time_utc",
-    "strike",
-    "snapshot_btc_price",
-    "snapshot_bot_label",
-    "snapshot_confidence",
-    "snapshot_bullish_signals",
-    "snapshot_bearish_signals",
-    "snapshot_atr_multiple",
-    "snapshot_ema_5",
-    "snapshot_ema_12",
-    "snapshot_rsi_14",
-    "side",
-    "contracts",
-    "entry_cents",
-    "exit_cents",
-    "fees",
-    "cost",
-    "proceeds",
-    "net_pnl",
-    "budget_cap",
-    "within_budget_cap",
-    "notes",
+    "logged_at_utc", "settlement_time_utc", "strike", "snapshot_btc_price",
+    "snapshot_bot_label", "snapshot_confidence", "snapshot_bullish_signals",
+    "snapshot_bearish_signals", "snapshot_atr_multiple", "snapshot_ema_5",
+    "snapshot_ema_12", "snapshot_rsi_14", "side", "contracts", "entry_cents",
+    "exit_cents", "fees", "cost", "proceeds", "net_pnl", "budget_cap",
+    "within_budget_cap", "notes",
 ]
 
 st.markdown(
     """
     <style>
-        .block-container {
-            max-width: 1200px;
-            padding-top: 0.9rem;
-            padding-bottom: 0.9rem;
-        }
-        [data-testid="stMetric"] {
-            background-color: rgba(128, 128, 128, 0.08);
-            border: 1px solid rgba(128, 128, 128, 0.18);
-            border-radius: 0.55rem;
-            padding: 0.45rem 0.65rem;
-        }
-        [data-testid="stMetricLabel"] {
-            font-size: 0.78rem;
-        }
-        [data-testid="stMetricValue"] {
-            font-size: 1.12rem;
-        }
-        h1 {
-            font-size: 1.6rem;
-            margin-bottom: 0.1rem;
-        }
-        h2, h3 {
-            font-size: 1.05rem;
-            margin-top: 0.45rem;
-        }
+        .block-container { max-width: 1200px; padding-top: 0.9rem; padding-bottom: 0.9rem; }
+        [data-testid="stMetric"] { background-color: rgba(128, 128, 128, 0.08); border: 1px solid rgba(128, 128, 128, 0.18); border-radius: 0.55rem; padding: 0.45rem 0.65rem; }
+        [data-testid="stMetricLabel"] { font-size: 0.78rem; }
+        [data-testid="stMetricValue"] { font-size: 1.12rem; }
+        h1 { font-size: 1.6rem; margin-bottom: 0.1rem; }
+        h2, h3 { font-size: 1.05rem; margin-top: 0.45rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -86,40 +49,26 @@ def get_live_btc_price():
     )
     response.raise_for_status()
     data = response.json()
-    return {
-        "price": float(data["price"]),
-        "time": pd.to_datetime(data["time"], utc=True),
-    }
+    return {"price": float(data["price"]), "time": pd.to_datetime(data["time"], utc=True)}
 
 
 @st.cache_data(ttl=25, show_spinner=False)
 def get_btc_candles(limit=90):
     end_time = datetime.now(timezone.utc)
     start_time = end_time - pd.Timedelta(minutes=limit)
-
     response = requests.get(
         "https://api.exchange.coinbase.com/products/BTC-USD/candles",
-        params={
-            "granularity": 60,
-            "start": start_time.isoformat(),
-            "end": end_time.isoformat(),
-        },
+        params={"granularity": 60, "start": start_time.isoformat(), "end": end_time.isoformat()},
         headers={"User-Agent": "btc-kalshi-dashboard/1.0"},
         timeout=15,
     )
     response.raise_for_status()
     rows = response.json()
-
     if not rows:
         raise ValueError("Coinbase returned no BTC candle data.")
-
-    df = pd.DataFrame(
-        rows,
-        columns=["open_time", "low", "high", "open", "close", "volume"],
-    )
+    df = pd.DataFrame(rows, columns=["open_time", "low", "high", "open", "close", "volume"])
     for column in ["open", "high", "low", "close", "volume"]:
         df[column] = pd.to_numeric(df[column])
-
     df["time"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
     return df.sort_values("time").reset_index(drop=True)
 
@@ -128,19 +77,11 @@ def get_btc_candles(limit=90):
 def get_kalshi_market(ticker):
     if not ticker.strip():
         return None, None, None
-
     try:
-        market_response = requests.get(
-            f"{KALSHI_BASE}/markets/{ticker.strip()}",
-            timeout=10,
-        )
+        market_response = requests.get(f"{KALSHI_BASE}/markets/{ticker.strip()}", timeout=10)
         market_response.raise_for_status()
         market = market_response.json().get("market", market_response.json())
-
-        book_response = requests.get(
-            f"{KALSHI_BASE}/markets/{ticker.strip()}/orderbook",
-            timeout=10,
-        )
+        book_response = requests.get(f"{KALSHI_BASE}/markets/{ticker.strip()}/orderbook", timeout=10)
         book_response.raise_for_status()
         orderbook = book_response.json().get("orderbook", book_response.json())
         return market, orderbook, None
@@ -148,20 +89,20 @@ def get_kalshi_market(ticker):
         return None, None, str(error)
 
 
+def extract_market_prices(market, side):
+    if not market:
+        return None, None
+    if side == "YES":
+        return market.get("yes_bid"), market.get("yes_ask")
+    return market.get("no_bid"), market.get("no_ask")
+
+
 def calculate_rsi(closes, period=14):
     deltas = closes.diff()
     gains = deltas.clip(lower=0)
     losses = -deltas.clip(upper=0)
-    average_gain = gains.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-    average_loss = losses.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
+    average_gain = gains.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    average_loss = losses.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     relative_strength = average_gain / average_loss.replace(0, np.nan)
     return (100 - (100 / (1 + relative_strength))).fillna(50.0)
 
@@ -169,11 +110,7 @@ def calculate_rsi(closes, period=14):
 def calculate_atr(df, period=5):
     previous_close = df["close"].shift(1)
     true_range = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs(),
-        ],
+        [df["high"] - df["low"], (df["high"] - previous_close).abs(), (df["low"] - previous_close).abs()],
         axis=1,
     ).max(axis=1)
     return true_range.rolling(period, min_periods=period).mean()
@@ -191,19 +128,15 @@ def calculate_chart_bot(df, strike, live_price):
     ema_12 = float(bot_df["ema_12"].iloc[-1])
     rsi_14 = float(bot_df["rsi_14"].iloc[-1])
     atr_5 = float(bot_df["atr_5"].iloc[-1])
-
     recent_15 = bot_df.tail(15)
     range_high = float(recent_15["high"].max())
     range_low = float(recent_15["low"].min())
     range_midpoint = (range_high + range_low) / 2
-
     last_three = bot_df.tail(3)
     green_candles = int((last_three["close"] > last_three["open"]).sum())
     red_candles = int((last_three["close"] < last_three["open"]).sum())
-
     distance_dollars = abs(current_price - strike)
     atr_multiple = distance_dollars / atr_5 if atr_5 > 0 else 0.0
-
     price_above_strike = current_price > strike
     price_below_strike = current_price < strike
     bullish_signals = 0
@@ -268,25 +201,17 @@ def calculate_chart_bot(df, strike, live_price):
     bearish_pressure = bearish_signals >= 3
     reversal_watch = False
     reversal_reason = "No strong conflict between price location and momentum."
-
     if price_above_strike and bearish_pressure:
         reversal_watch = True
-        reversal_reason = (
-            "Price is above strike, but at least three short-term signals are bearish."
-        )
+        reversal_reason = "Price is above strike, but at least three short-term signals are bearish."
     elif price_below_strike and bullish_pressure:
         reversal_watch = True
-        reversal_reason = (
-            "Price is below strike, but at least three short-term signals are bullish."
-        )
+        reversal_reason = "Price is below strike, but at least three short-term signals are bullish."
 
     if atr_multiple < 1:
         label = "TOO CLOSE / NO CLEAR EDGE"
         confidence = "Low"
-        summary = (
-            "Price is within one recent ATR of the strike. Ordinary BTC volatility "
-            "could change the above/below result."
-        )
+        summary = "Price is within one recent ATR of the strike. Ordinary BTC volatility could change the above/below result."
     elif reversal_watch and price_above_strike:
         label = "ABOVE — WEAKENING / REVERSAL WATCH"
         confidence = "Low"
@@ -309,48 +234,28 @@ def calculate_chart_bot(df, strike, live_price):
         summary = "Price location and short-term momentum do not agree strongly enough."
 
     return {
-        "df": bot_df,
-        "label": label,
-        "confidence": confidence,
-        "summary": summary,
-        "bullish_signals": bullish_signals,
-        "bearish_signals": bearish_signals,
-        "distance_dollars": distance_dollars,
-        "ema_5": ema_5,
-        "ema_12": ema_12,
-        "rsi_14": rsi_14,
-        "atr_5": atr_5,
-        "atr_multiple": atr_multiple,
-        "cushion_label": cushion_label,
-        "range_high": range_high,
-        "range_low": range_low,
-        "reversal_watch": reversal_watch,
-        "reversal_reason": reversal_reason,
+        "df": bot_df, "label": label, "confidence": confidence, "summary": summary,
+        "bullish_signals": bullish_signals, "bearish_signals": bearish_signals,
+        "distance_dollars": distance_dollars, "ema_5": ema_5, "ema_12": ema_12,
+        "rsi_14": rsi_14, "atr_5": atr_5, "atr_multiple": atr_multiple,
+        "cushion_label": cushion_label, "range_high": range_high, "range_low": range_low,
+        "reversal_watch": reversal_watch, "reversal_reason": reversal_reason,
         "signals": signal_rows,
     }
 
 
-def calculate_budget_plan(
-    bankroll,
-    reserve_cash,
-    risk_per_trade,
-    buy_limit_cents,
-    sell_limit_cents,
-):
+def calculate_budget_plan(bankroll, reserve_cash, risk_per_trade, buy_limit_cents, sell_limit_cents):
     available_for_orders = max(bankroll - reserve_cash, 0)
     buy_price = buy_limit_cents / 100
     sell_price = sell_limit_cents / 100
-
     contracts_by_risk = math.floor(risk_per_trade / buy_price) if buy_price > 0 else 0
     contracts_by_cash = math.floor(available_for_orders / buy_price) if buy_price > 0 else 0
     contracts_allowed = max(min(contracts_by_risk, contracts_by_cash), 0)
-
     maximum_cost = contracts_allowed * buy_price
     potential_sale_proceeds = contracts_allowed * sell_price
     potential_profit = potential_sale_proceeds - maximum_cost
     maximum_settlement_value = float(contracts_allowed)
     maximum_settlement_profit = maximum_settlement_value - maximum_cost
-
     warnings = []
     if reserve_cash >= bankroll:
         warnings.append("Reserve cash is equal to or larger than the bankroll, so no order budget remains.")
@@ -362,16 +267,11 @@ def calculate_budget_plan(
         warnings.append("Risk cap or available cash is too low to purchase one contract at this limit.")
     if risk_per_trade > bankroll * 0.05:
         warnings.append("Risk per trade exceeds 5% of the bankroll. Consider a smaller fixed cap.")
-
     return {
-        "available_for_orders": available_for_orders,
-        "contracts_allowed": contracts_allowed,
-        "maximum_cost": maximum_cost,
-        "potential_sale_proceeds": potential_sale_proceeds,
-        "potential_profit": potential_profit,
-        "maximum_settlement_value": maximum_settlement_value,
-        "maximum_settlement_profit": maximum_settlement_profit,
-        "warnings": warnings,
+        "available_for_orders": available_for_orders, "contracts_allowed": contracts_allowed,
+        "maximum_cost": maximum_cost, "potential_sale_proceeds": potential_sale_proceeds,
+        "potential_profit": potential_profit, "maximum_settlement_value": maximum_settlement_value,
+        "maximum_settlement_profit": maximum_settlement_profit, "warnings": warnings,
     }
 
 
@@ -381,16 +281,11 @@ def new_empty_trade_log():
 
 def create_trade_snapshot(settlement_time, strike, live_quote, chart_bot):
     return {
-        "settlement_time_utc": settlement_time.isoformat(),
-        "strike": round(float(strike), 2),
-        "snapshot_btc_price": round(float(live_quote["price"]), 2),
-        "snapshot_bot_label": chart_bot["label"],
-        "snapshot_confidence": chart_bot["confidence"],
-        "snapshot_bullish_signals": chart_bot["bullish_signals"],
-        "snapshot_bearish_signals": chart_bot["bearish_signals"],
-        "snapshot_atr_multiple": round(float(chart_bot["atr_multiple"]), 3),
-        "snapshot_ema_5": round(float(chart_bot["ema_5"]), 2),
-        "snapshot_ema_12": round(float(chart_bot["ema_12"]), 2),
+        "settlement_time_utc": settlement_time.isoformat(), "strike": round(float(strike), 2),
+        "snapshot_btc_price": round(float(live_quote["price"]), 2), "snapshot_bot_label": chart_bot["label"],
+        "snapshot_confidence": chart_bot["confidence"], "snapshot_bullish_signals": chart_bot["bullish_signals"],
+        "snapshot_bearish_signals": chart_bot["bearish_signals"], "snapshot_atr_multiple": round(float(chart_bot["atr_multiple"]), 3),
+        "snapshot_ema_5": round(float(chart_bot["ema_5"]), 2), "snapshot_ema_12": round(float(chart_bot["ema_12"]), 2),
         "snapshot_rsi_14": round(float(chart_bot["rsi_14"]), 2),
     }
 
@@ -399,26 +294,14 @@ def add_trade_to_log(snapshot, side, contracts, entry_cents, exit_cents, fees, n
     cost = contracts * (entry_cents / 100)
     proceeds = contracts * (exit_cents / 100)
     net_pnl = proceeds - cost - fees
-
     row = {
-        "logged_at_utc": datetime.now(timezone.utc).isoformat(),
-        **snapshot,
-        "side": side,
-        "contracts": contracts,
-        "entry_cents": entry_cents,
-        "exit_cents": exit_cents,
-        "fees": round(fees, 2),
-        "cost": round(cost, 2),
-        "proceeds": round(proceeds, 2),
-        "net_pnl": round(net_pnl, 2),
-        "budget_cap": round(budget_cap, 2),
-        "within_budget_cap": cost <= budget_cap,
-        "notes": notes,
+        "logged_at_utc": datetime.now(timezone.utc).isoformat(), **snapshot, "side": side,
+        "contracts": contracts, "entry_cents": entry_cents, "exit_cents": exit_cents,
+        "fees": round(fees, 2), "cost": round(cost, 2), "proceeds": round(proceeds, 2),
+        "net_pnl": round(net_pnl, 2), "budget_cap": round(budget_cap, 2),
+        "within_budget_cap": cost <= budget_cap, "notes": notes,
     }
-    st.session_state.trade_log = pd.concat(
-        [st.session_state.trade_log, pd.DataFrame([row])],
-        ignore_index=True,
-    )
+    st.session_state.trade_log = pd.concat([st.session_state.trade_log, pd.DataFrame([row])], ignore_index=True)
 
 
 if "trade_log" not in st.session_state:
@@ -429,67 +312,31 @@ if "auto_snapshot_key" not in st.session_state:
     st.session_state.auto_snapshot_key = None
 
 st.title("₿ BTC Live 15-Minute Monitor")
-st.caption(
-    "Live Coinbase quote + 1-minute chart research. Read-only; it cannot place, close, or modify Kalshi orders."
-)
+st.caption("Live Coinbase quote + 1-minute chart research. Read-only; it cannot place, close, or modify Kalshi orders.")
 
 with st.sidebar:
     st.header("Contract inputs")
-    kalshi_ticker = st.text_input(
-        "Kalshi market ticker (optional)",
-        placeholder="KXBTC...",
-    )
-    strike = st.number_input(
-        "BTC threshold / strike",
-        min_value=1.0,
-        value=85513.00,
-        step=0.01,
-    )
-    settlement_input = st.text_input(
-        "Settlement time (UTC)",
-        value="2026-09-22T03:30:00Z",
-        help="Example: 10:30 PM CDT = 03:30 UTC the following day.",
-    )
-    refresh_seconds = st.selectbox(
-        "Live panel interval",
-        options=[1, 2, 5, 10],
-        index=1,
-        help="The live dashboard panel refreshes automatically at this interval.",
-    )
+    kalshi_ticker = st.text_input("Kalshi market ticker (optional)", placeholder="KXBTC...")
+    strike = st.number_input("BTC threshold / strike", min_value=1.0, value=85513.00, step=0.01)
+    settlement_input = st.text_input("Settlement time (UTC)", value="2026-09-22T03:30:00Z", help="Example: 10:30 PM CDT = 03:30 UTC the following day.")
+    refresh_seconds = st.selectbox("Live panel interval", options=[1, 2, 5, 10], index=1, help="The live dashboard panel refreshes automatically at this interval.")
     st.caption(f"Candles and indicators are cached for {CHART_REFRESH_SECONDS} seconds.")
-
     st.divider()
     st.header("Budget & limit planner")
-    bankroll = st.number_input(
-        "Current bankroll ($)", min_value=0.0, value=69.00, step=1.00
-    )
-    reserve_cash = st.number_input(
-        "Cash reserve ($)", min_value=0.0, value=24.00, step=1.00
-    )
-    risk_per_trade = st.number_input(
-        "Maximum risk per trade ($)", min_value=0.0, value=2.00, step=0.50
-    )
-    contract_side = st.selectbox(
-        "Contract side you are evaluating", options=["YES", "NO"]
-    )
-    buy_limit_cents = st.number_input(
-        "Your maximum buy limit (¢)", min_value=1, max_value=99, value=40, step=1
-    )
-    sell_limit_cents = st.number_input(
-        "Your planned take-profit limit (¢)", min_value=1, max_value=99, value=55, step=1
-    )
+    bankroll = st.number_input("Current bankroll ($)", min_value=0.0, value=69.00, step=1.00)
+    reserve_cash = st.number_input("Cash reserve ($)", min_value=0.0, value=24.00, step=1.00)
+    risk_per_trade = st.number_input("Maximum risk per trade ($)", min_value=0.0, value=2.00, step=0.50)
+    contract_side = st.selectbox("Contract side you are evaluating", options=["YES", "NO"])
+    buy_limit_cents = st.number_input("Your maximum buy limit (¢)", min_value=1, max_value=99, value=40, step=1)
+    sell_limit_cents = st.number_input("Your planned take-profit limit (¢)", min_value=1, max_value=99, value=55, step=1)
 
 try:
-    settlement_time = datetime.fromisoformat(
-        settlement_input.replace("Z", "+00:00")
-    )
+    settlement_time = datetime.fromisoformat(settlement_input.replace("Z", "+00:00"))
 except ValueError:
     st.error("Use UTC format like: 2026-09-22T03:30:00Z")
     st.stop()
 
-budget_plan = calculate_budget_plan(
-    bankroll, reserve_cash, risk_per_trade, buy_limit_cents, sell_limit_cents
-)
+budget_plan = calculate_budget_plan(bankroll, reserve_cash, risk_per_trade, buy_limit_cents, sell_limit_cents)
 
 
 @st.fragment(run_every=f"{refresh_seconds}s")
@@ -500,7 +347,6 @@ def live_dashboard():
     except (requests.RequestException, ValueError) as error:
         st.error(f"Could not load live market data: {error}")
         return
-
     if len(candles) < 31:
         st.error("Not enough BTC candles returned. Please wait for the next refresh.")
         return
@@ -509,11 +355,8 @@ def live_dashboard():
     seconds_left = max((settlement_time - now_utc).total_seconds(), 0)
     minutes_left = seconds_left / 60
     chart_bot = calculate_chart_bot(candles, strike, live_quote["price"])
-    current_snapshot = create_trade_snapshot(
-        settlement_time, strike, live_quote, chart_bot
-    )
+    current_snapshot = create_trade_snapshot(settlement_time, strike, live_quote, chart_bot)
     st.session_state.latest_snapshot = current_snapshot
-
     snapshot_key = f"{settlement_time.isoformat()}|{strike:.2f}"
     if seconds_left <= 0 and st.session_state.auto_snapshot_key != snapshot_key:
         st.session_state.auto_snapshot_key = snapshot_key
@@ -525,21 +368,10 @@ def live_dashboard():
     distance_col.metric("Distance", f"${live_quote['price'] - strike:,.2f}")
     time_col.metric("Minutes left", f"{minutes_left:.2f}")
     quote_col.metric("Quote time", live_quote["time"].strftime("%H:%M:%S UTC"))
-
-    st.caption(
-        f"Live panel updates every {refresh_seconds} second(s). "
-        f"Candles, EMA, RSI, and ATR refresh at most every {CHART_REFRESH_SECONDS} seconds."
-    )
-
-    if seconds_left <= 0:
-        st.info(
-            "Clock has reached zero. The most recent dashboard data is saved as the trade-log snapshot. "
-            "Confirm settlement using the market's official rules and source."
-        )
+    st.caption(f"Live panel updates every {refresh_seconds} second(s). Candles, EMA, RSI, and ATR refresh at most every {CHART_REFRESH_SECONDS} seconds.")
 
     st.divider()
     st.subheader("Chart research bot")
-
     bot_col1, bot_col2, bot_col3, bot_col4, bot_col5 = st.columns(5)
     bot_col1.metric("Bot result", chart_bot["label"])
     bot_col2.metric("Confidence", chart_bot["confidence"])
@@ -549,116 +381,122 @@ def live_dashboard():
     st.caption(chart_bot["summary"])
 
     if chart_bot["reversal_watch"]:
-        st.warning(
-            f"REVERSAL WATCH: {chart_bot['reversal_reason']} "
-            "This is a research warning, not a recommendation to increase position size."
-        )
+        st.warning(f"REVERSAL WATCH: {chart_bot['reversal_reason']} This is a research warning, not a recommendation to increase position size.")
     elif chart_bot["atr_multiple"] < 1:
-        st.info(
-            "STRIKE RISK: Price is close to the strike relative to recent volatility. "
-            "A normal move could change the above/below result."
-        )
+        st.info("STRIKE RISK: Price is close to the strike relative to recent volatility. A normal move could change the above/below result.")
     else:
         st.success("No strong conflict between current price location and short-term momentum.")
 
     with st.expander("Show chart-bot signals"):
-        signal_df = pd.DataFrame(
-            chart_bot["signals"], columns=["Indicator", "Signal", "Explanation"]
-        )
+        signal_df = pd.DataFrame(chart_bot["signals"], columns=["Indicator", "Signal", "Explanation"])
         st.dataframe(signal_df, use_container_width=True, hide_index=True)
-
         detail_col1, detail_col2, detail_col3, detail_col4 = st.columns(4)
         detail_col1.metric("EMA 5", f"${chart_bot['ema_5']:,.2f}")
         detail_col2.metric("EMA 12", f"${chart_bot['ema_12']:,.2f}")
         detail_col3.metric("RSI 14", f"{chart_bot['rsi_14']:.1f}")
         detail_col4.metric("5-min ATR", f"${chart_bot['atr_5']:,.2f}")
-        st.caption(
-            f"Distance from strike: ${chart_bot['distance_dollars']:,.2f} | "
-            f"ATR multiple: {chart_bot['atr_multiple']:.2f}× | "
-            f"15-minute range: ${chart_bot['range_low']:,.2f} to ${chart_bot['range_high']:,.2f}"
-        )
+        st.caption(f"Distance from strike: ${chart_bot['distance_dollars']:,.2f} | ATR multiple: {chart_bot['atr_multiple']:.2f}× | 15-minute range: ${chart_bot['range_low']:,.2f} to ${chart_bot['range_high']:,.2f}")
 
     left_column, right_column = st.columns([2, 1])
     with left_column:
         chart_df = chart_bot["df"]
         figure = go.Figure()
-        figure.add_trace(
-            go.Candlestick(
-                x=chart_df["time"], open=chart_df["open"], high=chart_df["high"],
-                low=chart_df["low"], close=chart_df["close"], name="BTC/USD"
-            )
-        )
-        figure.add_trace(
-            go.Scatter(
-                x=chart_df["time"], y=chart_df["ema_5"], mode="lines", name="EMA 5",
-                line=dict(color="#00cc96", width=1.5)
-            )
-        )
-        figure.add_trace(
-            go.Scatter(
-                x=chart_df["time"], y=chart_df["ema_12"], mode="lines", name="EMA 12",
-                line=dict(color="#636efa", width=1.5)
-            )
-        )
-        figure.add_hline(
-            y=strike, line_dash="dash", line_color="#f5c542",
-            annotation_text=f"Strike ${strike:,.2f}"
-        )
-        figure.add_hline(
-            y=live_quote["price"], line_dash="dot", line_color="#00cc96",
-            annotation_text=f"Live ${live_quote['price']:,.2f}"
-        )
-        figure.update_layout(
-            title="BTC 1-Minute Candles with Live Price and EMA Lines",
-            height=480, margin=dict(l=10, r=10, t=40, b=10),
-            xaxis_rangeslider_visible=False, yaxis_title="BTC price"
-        )
+        figure.add_trace(go.Candlestick(x=chart_df["time"], open=chart_df["open"], high=chart_df["high"], low=chart_df["low"], close=chart_df["close"], name="BTC/USD"))
+        figure.add_trace(go.Scatter(x=chart_df["time"], y=chart_df["ema_5"], mode="lines", name="EMA 5", line=dict(color="#00cc96", width=1.5)))
+        figure.add_trace(go.Scatter(x=chart_df["time"], y=chart_df["ema_12"], mode="lines", name="EMA 12", line=dict(color="#636efa", width=1.5)))
+        figure.add_hline(y=strike, line_dash="dash", line_color="#f5c542", annotation_text=f"Strike ${strike:,.2f}")
+        figure.add_hline(y=live_quote["price"], line_dash="dot", line_color="#00cc96", annotation_text=f"Live ${live_quote['price']:,.2f}")
+        figure.update_layout(title="BTC 1-Minute Candles with Live Price and EMA Lines", height=480, margin=dict(l=10, r=10, t=40, b=10), xaxis_rangeslider_visible=False, yaxis_title="BTC price")
         st.plotly_chart(figure, use_container_width=True)
+
+        if seconds_left <= 0:
+            st.info("Clock has reached zero. The most recent dashboard data is saved as the trade-log snapshot. Confirm settlement using the market's official rules and source.")
 
     with right_column:
         st.subheader("Signal interpretation")
         st.metric("Signal label", chart_bot["label"])
         st.metric("Distance vs ATR", f"{chart_bot['atr_multiple']:.2f}×")
-        st.write(
-            "The dashboard is informational only. It does not recommend adding money, "
-            "opening a trade, closing a trade, or setting an auto-sell price."
-        )
+        st.write("The dashboard is informational only. It does not recommend adding money, opening a trade, closing a trade, or setting an auto-sell price.")
 
 
 live_dashboard()
 
 st.divider()
 st.subheader("Budget & limit planner")
-st.caption(
-    "Enter your own limits first. This calculator checks size and cash exposure; it does not generate a trade, buy price, or sell price."
-)
-
+st.caption("Enter your own limits first. This calculator checks size and cash exposure; it does not generate a trade, buy price, or sell price.")
 plan_col1, plan_col2, plan_col3, plan_col4 = st.columns(4)
 plan_col1.metric("Side evaluated", contract_side)
 plan_col2.metric("Available after reserve", f"${budget_plan['available_for_orders']:,.2f}")
 plan_col3.metric("Maximum contracts", str(budget_plan["contracts_allowed"]))
 plan_col4.metric("Maximum order cost", f"${budget_plan['maximum_cost']:,.2f}")
-
 plan_col5, plan_col6, plan_col7, plan_col8 = st.columns(4)
 plan_col5.metric("Buy limit", f"{buy_limit_cents}¢")
 plan_col6.metric("Take-profit limit", f"{sell_limit_cents}¢")
 plan_col7.metric("Proceeds at target", f"${budget_plan['potential_sale_proceeds']:,.2f}")
 plan_col8.metric("Gross target profit", f"${budget_plan['potential_profit']:,.2f}")
-
 if budget_plan["warnings"]:
     for warning in budget_plan["warnings"]:
         st.warning(warning)
 else:
-    st.success(
-        "Planner check passed: proposed order stays within your stated trade-risk cap and protects the stated cash reserve."
-    )
+    st.success("Planner check passed: proposed order stays within your stated trade-risk cap and protects the stated cash reserve.")
+
+st.divider()
+st.subheader("Live market context")
+st.caption("Read-only comparison of your manual limits with the public Kalshi market. It does not generate trade instructions or submit orders.")
+
+if not kalshi_ticker.strip():
+    st.info("Enter a Kalshi market ticker in the sidebar to display live bid/ask context.")
+else:
+    market, orderbook, kalshi_error = get_kalshi_market(kalshi_ticker)
+    if kalshi_error:
+        st.error(f"Could not load Kalshi market context: {kalshi_error}")
+    elif market:
+        live_bid, live_ask = extract_market_prices(market, contract_side)
+        try:
+            live_bid = int(live_bid) if live_bid is not None else None
+            live_ask = int(live_ask) if live_ask is not None else None
+        except (TypeError, ValueError):
+            live_bid, live_ask = None, None
+
+        context_col1, context_col2, context_col3, context_col4 = st.columns(4)
+        context_col1.metric(f"Live {contract_side} bid", f"{live_bid}¢" if live_bid is not None else "N/A")
+        context_col2.metric(f"Live {contract_side} ask", f"{live_ask}¢" if live_ask is not None else "N/A")
+        spread = live_ask - live_bid if live_bid is not None and live_ask is not None else None
+        context_col3.metric("Bid / ask spread", f"{spread}¢" if spread is not None else "N/A")
+        context_col4.metric("Your manual buy ceiling", f"{buy_limit_cents}¢")
+
+        if live_ask is None:
+            st.info("No current ask was returned for the selected side. Check the order book and market status.")
+        elif live_ask <= buy_limit_cents:
+            st.success(
+                f"Price comparison only: the displayed {contract_side} ask ({live_ask}¢) is at or below your manual ceiling ({buy_limit_cents}¢). "
+                "Review the contract rules, chart context, and available size yourself."
+            )
+        else:
+            difference = live_ask - buy_limit_cents
+            st.info(
+                f"Price comparison only: the displayed {contract_side} ask is {difference}¢ above your manual ceiling. "
+                "A limit order at your ceiling would generally rest unless a seller matches it."
+            )
+
+        sell_col1, sell_col2, sell_col3 = st.columns(3)
+        sell_col1.metric("Your manual sell target", f"{sell_limit_cents}¢")
+        sell_col2.metric(f"Live {contract_side} bid", f"{live_bid}¢" if live_bid is not None else "N/A")
+        target_distance = sell_limit_cents - live_bid if live_bid is not None else None
+        sell_col3.metric("Distance to target", f"{target_distance}¢" if target_distance is not None else "N/A")
+
+        if live_bid is not None:
+            if live_bid >= sell_limit_cents:
+                st.success("Price comparison only: the displayed bid is at or above your manual sell target.")
+            else:
+                st.caption("The displayed bid is below your manual sell target. A limit sale at your target may remain resting until a buyer matches it.")
+
+        with st.expander("Show public Kalshi order-book data"):
+            st.json(orderbook)
 
 st.divider()
 st.subheader("Trade log")
-st.caption(
-    "When the clock reaches zero, the dashboard keeps the latest market snapshot. Enter the actual fills manually, then download the CSV after your session."
-)
-
+st.caption("When the clock reaches zero, the dashboard keeps the latest market snapshot. Enter the actual fills manually, then download the CSV after your session.")
 if st.session_state.latest_snapshot:
     snapshot = st.session_state.latest_snapshot
     snapshot_col1, snapshot_col2, snapshot_col3, snapshot_col4 = st.columns(4)
@@ -673,38 +511,18 @@ with st.form("trade_log_form", clear_on_submit=True):
     st.write("Add a completed trade")
     form_col1, form_col2, form_col3, form_col4 = st.columns(4)
     logged_side = form_col1.selectbox("Side traded", options=["YES", "NO"])
-    logged_contracts = form_col2.number_input(
-        "Contracts", min_value=1, value=1, step=1
-    )
-    logged_entry = form_col3.number_input(
-        "Actual entry (¢)", min_value=1, max_value=99, value=40, step=1
-    )
-    logged_exit = form_col4.number_input(
-        "Actual exit / settlement (¢)", min_value=0, max_value=100, value=55, step=1
-    )
-    logged_fees = st.number_input(
-        "Total fees ($)", min_value=0.0, value=0.00, step=0.01
-    )
-    logged_notes = st.text_area(
-        "Notes (optional)",
-        placeholder="Example: Followed plan; sell limit filled before settlement.",
-    )
+    logged_contracts = form_col2.number_input("Contracts", min_value=1, value=1, step=1)
+    logged_entry = form_col3.number_input("Actual entry (¢)", min_value=1, max_value=99, value=40, step=1)
+    logged_exit = form_col4.number_input("Actual exit / settlement (¢)", min_value=0, max_value=100, value=55, step=1)
+    logged_fees = st.number_input("Total fees ($)", min_value=0.0, value=0.00, step=0.01)
+    logged_notes = st.text_area("Notes (optional)", placeholder="Example: Followed plan; sell limit filled before settlement.")
     save_trade = st.form_submit_button("Save completed trade")
 
 if save_trade:
     if st.session_state.latest_snapshot is None:
         st.error("No market snapshot is available yet. Wait for the live panel to load.")
     else:
-        add_trade_to_log(
-            st.session_state.latest_snapshot,
-            logged_side,
-            int(logged_contracts),
-            int(logged_entry),
-            int(logged_exit),
-            float(logged_fees),
-            logged_notes,
-            risk_per_trade,
-        )
+        add_trade_to_log(st.session_state.latest_snapshot, logged_side, int(logged_contracts), int(logged_entry), int(logged_exit), float(logged_fees), logged_notes, risk_per_trade)
         st.success("Trade saved to this browser session's log.")
 
 trade_log = st.session_state.trade_log.copy()
@@ -715,35 +533,10 @@ if not trade_log.empty:
     log_col2.metric("Net P&L", f"${trade_log['net_pnl'].sum():,.2f}")
     log_col3.metric("Average net P&L", f"${trade_log['net_pnl'].mean():,.2f}")
     log_col4.metric("Win rate", f"{(trade_log['net_pnl'] > 0).mean() * 100:.1f}%")
-
     st.dataframe(trade_log, use_container_width=True, hide_index=True)
     csv_data = trade_log.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download trade log CSV",
-        data=csv_data,
-        file_name="btc_trade_log.csv",
-        mime="text/csv",
-    )
+    st.download_button("Download trade log CSV", data=csv_data, file_name="btc_trade_log.csv", mime="text/csv")
 else:
     st.info("No completed trades logged yet.")
 
-if kalshi_ticker.strip():
-    st.divider()
-    st.subheader("Kalshi public market data")
-    market, orderbook, kalshi_error = get_kalshi_market(kalshi_ticker)
-
-    if kalshi_error:
-        st.error(f"Could not load Kalshi data: {kalshi_error}")
-    elif market:
-        market_col1, market_col2, market_col3 = st.columns(3)
-        market_col1.metric("Market", market.get("title", "Not provided"))
-        market_col2.metric("YES bid", f"{market.get('yes_bid', 'N/A')}¢")
-        market_col3.metric("YES ask", f"{market.get('yes_ask', 'N/A')}¢")
-        with st.expander("Show public Kalshi order-book data"):
-            st.json(orderbook)
-
-st.caption(
-    "Research only, not financial or betting advice. The trade log is stored only in the current browser session. "
-    "Download the CSV regularly; a page reload, browser close, or Streamlit redeploy can clear it."
-)
-
+st.caption("Research only, not financial or betting advice. The trade log is stored only in the current browser session. Download the CSV regularly; a page reload, browser close, or Streamlit redeploy can clear it. Limit orders may not fill or may fill only partially.")
